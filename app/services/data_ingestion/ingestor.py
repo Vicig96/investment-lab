@@ -4,16 +4,50 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import select, text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.instrument import Instrument
 from app.models.price_candle import PriceCandle
 from app.services.data_ingestion.csv_loader import parse_ohlcv_csv
 
 logger = get_logger(__name__)
+
+
+def _build_upsert(records: list[dict]):
+    """Build a dialect-aware INSERT … ON CONFLICT DO UPDATE statement."""
+    settings = get_settings()
+
+    if settings.is_sqlite:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        stmt = sqlite_insert(PriceCandle).values(records)
+        return stmt.on_conflict_do_update(
+            index_elements=["instrument_id", "date"],
+            set_={
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "adj_close": stmt.excluded.adj_close,
+                "volume": stmt.excluded.volume,
+            },
+        )
+    else:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        stmt = pg_insert(PriceCandle).values(records)
+        return stmt.on_conflict_do_update(
+            constraint="uq_price_candles_instrument_id_date",
+            set_={
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "adj_close": stmt.excluded.adj_close,
+                "volume": stmt.excluded.volume,
+            },
+        )
 
 
 async def ingest_csv(
@@ -52,18 +86,7 @@ async def ingest_csv(
         for row in rows
     ]
 
-    stmt = pg_insert(PriceCandle).values(records)
-    stmt = stmt.on_conflict_do_update(
-        constraint="uq_price_candles_instrument_id_date",
-        set_={
-            "open": stmt.excluded.open,
-            "high": stmt.excluded.high,
-            "low": stmt.excluded.low,
-            "close": stmt.excluded.close,
-            "adj_close": stmt.excluded.adj_close,
-            "volume": stmt.excluded.volume,
-        },
-    )
+    stmt = _build_upsert(records)
     await session.execute(stmt)
 
     logger.info("csv_ingested", instrument_id=str(instrument_id), rows=len(records))

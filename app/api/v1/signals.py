@@ -4,13 +4,32 @@ from datetime import date
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select, func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.core.config import get_settings
 from app.core.dependencies import SessionDep
 from app.models.price_candle import PriceCandle
 from app.models.signal import Signal
 from app.schemas.signal import SignalRunRequest, SignalRead, SignalList, StrategyInfo, StrategyListResponse
 from app.services.signals.registry import get_strategy, list_strategies
+
+
+def _build_signal_upsert(records: list[dict]):
+    """Dialect-aware INSERT … ON CONFLICT for signals."""
+    settings = get_settings()
+    if settings.is_sqlite:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        stmt = sqlite_insert(Signal).values(records)
+        return stmt.on_conflict_do_update(
+            index_elements=["instrument_id", "date", "strategy_name", "params"],
+            set_={"direction": stmt.excluded.direction},
+        )
+    else:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        stmt = pg_insert(Signal).values(records)
+        return stmt.on_conflict_do_update(
+            constraint="uq_signals_instrument_date_strategy_params",
+            set_={"direction": stmt.excluded.direction},
+        )
 
 router = APIRouter(tags=["signals"])
 
@@ -81,12 +100,7 @@ async def run_signals(body: SignalRunRequest, session: SessionDep) -> dict:
                 for idx, v in signal_series.items()
             ]
             if records:
-                stmt = pg_insert(Signal).values(records)
-                stmt = stmt.on_conflict_do_update(
-                    constraint="uq_signals_instrument_date_strategy_params",
-                    set_={"direction": stmt.excluded.direction},
-                )
-                await session.execute(stmt)
+                await session.execute(_build_signal_upsert(records))
 
     return {"strategy": body.strategy_name, "results": results}
 

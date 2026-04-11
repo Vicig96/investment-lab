@@ -4,9 +4,9 @@ from decimal import Decimal
 
 from sqlalchemy import Date, Numeric, BigInteger, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID
 
 from app.db.base import Base
+from app.db.types import GUID
 
 
 class PriceCandle(Base):
@@ -18,7 +18,7 @@ class PriceCandle(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     instrument_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("instruments.id", ondelete="CASCADE"), nullable=False
+        GUID(), ForeignKey("instruments.id", ondelete="CASCADE"), nullable=False
     )
     date: Mapped[date] = mapped_column(Date, nullable=False)
     open: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)

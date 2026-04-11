@@ -12,16 +12,74 @@ Private investment analysis application for personal use.
 |---|---|
 | Language | Python 3.11 |
 | Web framework | FastAPI |
-| Database | PostgreSQL 16 |
+| Database | **SQLite** (local dev, zero config) / PostgreSQL 16 (Docker/prod) |
 | ORM | SQLAlchemy 2 (async) |
-| Migrations | Alembic |
-| Containers | Docker Compose |
+| Migrations | Alembic (PostgreSQL) / auto create_all (SQLite) |
+| Containers | Docker Compose (optional) |
 | Tests | pytest + pytest-asyncio |
 | Logging | structlog (JSON in prod, colored in dev) |
 
 ---
 
-## Quick Start (Docker)
+## ⚡ Quick Start — Windows PowerShell (local, no Docker)
+
+**Prerequisite:** Python 3.11 installed and on PATH.  
+Check with: `python --version`
+
+```powershell
+# 1. Enter the project folder
+cd C:\Users\vici3\investment-lab
+
+# 2. Create a virtual environment
+python -m venv .venv
+
+# 3. Activate it
+.\.venv\Scripts\Activate.ps1
+# If you get a script execution error, run this first (once):
+#   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# 4. Install all dependencies
+pip install -e ".[dev]"
+
+# 5. Copy the example environment file
+Copy-Item .env.example .env
+# No edits needed — SQLite is the default, no DB server required.
+
+# 6. Start the server
+uvicorn app.main:app --reload
+```
+
+**That's it.** The server will:
+- Create `investlab.db` (SQLite file) automatically on first run
+- Print startup logs in the terminal
+- Be available at **http://127.0.0.1:8000/docs**
+
+> **PowerShell tip:** to stop the server press `Ctrl+C`.
+
+### Re-starting later
+
+```powershell
+cd C:\Users\vici3\investment-lab
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload
+```
+
+### Running tests (no database required)
+
+```powershell
+# Unit tests only — pure functions, no DB
+pytest tests/unit/ -v
+
+# All tests
+pytest -v
+
+# With coverage report
+pytest --cov=app --cov-report=term-missing
+```
+
+---
+
+## Quick Start (Docker + PostgreSQL)
 
 **Prerequisites:** Docker Desktop running.
 
@@ -30,9 +88,9 @@ Private investment analysis application for personal use.
 git clone <repo-url> investment-lab
 cd investment-lab
 
-# 2. Copy environment file
+# 2. Copy environment file and switch to PostgreSQL URLs
 cp .env.example .env
-# Edit .env if you want different credentials (optional for local dev)
+# In .env, comment the SQLite lines and uncomment the PostgreSQL lines
 
 # 3. Start the stack
 docker compose up --build
@@ -46,29 +104,25 @@ docker compose exec app alembic upgrade head
 
 ---
 
-## Quick Start (local, without Docker)
+## Quick Start (local, without Docker — macOS/Linux with SQLite)
 
-**Prerequisites:** Python 3.11, PostgreSQL running locally.
+**Prerequisites:** Python 3.11.
 
 ```bash
 # 1. Create virtual environment
 python3.11 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
 # 2. Install dependencies
 pip install -e ".[dev]"
 
-# 3. Configure environment
+# 3. Configure environment (SQLite default — no changes needed)
 cp .env.example .env
-# Edit DATABASE_URL and DATABASE_URL_SYNC in .env to point to your local PG
 
-# 4. Run migrations
-alembic upgrade head
-
-# 5. Start the server
+# 4. Start server (tables created automatically on first run)
 uvicorn app.main:app --reload
 
-# 6. Open the API docs
+# 5. Open the API docs
 # http://localhost:8000/docs
 ```
 

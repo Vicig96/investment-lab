@@ -4,18 +4,18 @@ from decimal import Decimal
 
 from sqlalchemy import Date, DateTime, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 from app.db.base import Base
+from app.db.types import GUID, JSONBCompat
 
 
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
     strategy_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    instruments: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    instruments: Mapped[list] = mapped_column(JSONBCompat(), nullable=False, default=list)
+    params: Mapped[dict] = mapped_column(JSONBCompat(), nullable=False, default=dict)
     date_from: Mapped[date] = mapped_column(Date, nullable=False)
     date_to: Mapped[date] = mapped_column(Date, nullable=False)
     initial_capital: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)

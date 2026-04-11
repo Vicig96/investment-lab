@@ -12,8 +12,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Database
-    database_url: str = "postgresql+asyncpg://investlab:investlab@localhost:5432/investlab"
-    database_url_sync: str = "postgresql+psycopg2://investlab:investlab@localhost:5432/investlab"
+    # Default → SQLite for zero-config local dev.
+    # Override in .env with postgresql+asyncpg://... for production.
+    database_url: str = "sqlite+aiosqlite:///./investlab.db"
+    database_url_sync: str = "sqlite:///./investlab.db"
 
     # Security
     secret_key: str = "changeme"
@@ -21,6 +23,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.env == "production"
+
+    @property
+    def is_sqlite(self) -> bool:
+        return self.database_url.startswith("sqlite")
 
 
 @lru_cache
