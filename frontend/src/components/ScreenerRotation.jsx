@@ -16,6 +16,36 @@ const DEFAULT = {
   defensive_tickers: 'TLT, GLD',
 }
 
+// ── Predefined experiment windows ────────────────────────────────────────────
+// Each entry represents a distinct market regime useful for systematic testing.
+// Clicking a preset populates date_from and date_to in the form.
+const PRESET_WINDOWS = [
+  {
+    label:     'Bull run',
+    date_from: '2019-01-01',
+    date_to:   '2021-12-31',
+    note:      'Extended equity bull market with COVID dip and recovery',
+  },
+  {
+    label:     'Rate hike bear',
+    date_from: '2022-01-01',
+    date_to:   '2023-12-31',
+    note:      'Fed tightening cycle — tech selloff, bond stress, sector rotation',
+  },
+  {
+    label:     'Mixed / volatile',
+    date_from: '2020-01-01',
+    date_to:   '2022-12-31',
+    note:      'COVID crash, V-shaped recovery, inflation onset',
+  },
+  {
+    label:     'Full cycle',
+    date_from: '2019-01-01',
+    date_to:   '2023-12-31',
+    note:      'Bull + bear + recovery — broadest regime coverage',
+  },
+]
+
 const STRATEGY_COLOR = 'var(--success)'
 const BENCHMARK_COLOR = '#60a5fa'
 const CASH_COLOR = '#f59e0b'
@@ -113,12 +143,23 @@ function parseSweepTopN(raw) {
 function validate(form) {
   const tickers = parseTickerList(form.instrument_tickers)
   if (!tickers.length) return 'At least one ticker is required.'
-  if (!form.date_from) return '"From" date is required.'
-  if (!form.date_to) return '"To" date is required.'
-  if (form.date_from >= form.date_to) return '"From" must be before "To".'
   if (Number(form.initial_capital) <= 0) return 'Initial capital must be > 0.'
   if (Number(form.commission_bps) < 0) return 'Commission must be >= 0.'
   if (Number(form.warmup_bars) < 0) return 'Warm-up bars must be >= 0.'
+
+  if (form.run_mode === 'cross_preset') {
+    const topNValues = parseSweepTopN(form.sweep_top_n)
+    if (!topNValues.length) return 'Enter at least one valid Top N value (1–20).'
+    if (parseTickerList(form.defensive_tickers).length === 0) {
+      return 'Add at least one defensive ticker — cross-preset runs both cash and defensive_asset.'
+    }
+    return null  // dates not needed — presets provide them
+  }
+
+  if (!form.date_from) return '"From" date is required.'
+  if (!form.date_to) return '"To" date is required.'
+  if (form.date_from >= form.date_to) return '"From" must be before "To".'
+
   if (form.run_mode === 'parameter_sweep') {
     const topNValues = parseSweepTopN(form.sweep_top_n)
     if (!topNValues.length) return 'Enter at least one valid Top N value (1–20) for the sweep.'
@@ -203,6 +244,96 @@ function calcDeltas(aMetrics, bMetrics) {
   return { eq, cagr, sharpe, dd }
 }
 
+// ── Cross-preset ranking helpers ──────────────────────────────────────────────
+
+// Given an array of numeric values, return an array of 1-based dense ranks.
+// Higher is better when higherIsBetter=true; ties get the same rank.
+function denseRank(values, higherIsBetter) {
+  const indexed = values.map((v, i) => ({ v: numericValue(v), i }))
+  const valid   = indexed.filter((x) => x.v != null)
+  if (!valid.length) return values.map(() => null)
+
+  // Sort descending if higher is better, ascending otherwise
+  valid.sort((a, b) => higherIsBetter ? b.v - a.v : a.v - b.v)
+
+  const ranks = new Array(values.length).fill(null)
+  let rank = 1
+  for (let j = 0; j < valid.length; j++) {
+    if (j > 0 && valid[j].v !== valid[j - 1].v) rank = j + 1
+    ranks[valid[j].i] = rank
+  }
+  return ranks
+}
+
+// For a set of configs across multiple presets, compute the average rank
+// across 4 metrics (cagr, sharpe, max_drawdown, calmar) within each preset,
+// then average those per-preset average ranks into a single overall score.
+// Lower score = better.
+function computeCrossPresetRanking(configKeys, resultsByConfig) {
+  // configKeys: string[], resultsByConfig: Map<configKey, Map<presetLabel, metrics>>
+  const RANK_METRICS = [
+    { key: 'cagr',         higher: true  },
+    { key: 'sharpe_ratio', higher: true  },
+    { key: 'max_drawdown', higher: false },  // lower |dd| is better
+    { key: 'calmar_ratio', higher: true  },
+  ]
+
+  // presetLabels: all unique preset labels across all configs
+  const presetLabels = []
+  for (const configMap of resultsByConfig.values()) {
+    for (const pLabel of configMap.keys()) {
+      if (!presetLabels.includes(pLabel)) presetLabels.push(pLabel)
+    }
+  }
+
+  // For each config, accumulate per-preset per-metric ranks
+  // avgRanks[configKey] = { perPreset: { presetLabel: avgRank }, overall: number }
+  const perPresetRanks = new Map() // configKey → Map<presetLabel, number[]>
+  for (const ck of configKeys) perPresetRanks.set(ck, new Map())
+
+  for (const pLabel of presetLabels) {
+    for (const metric of RANK_METRICS) {
+      const rawValues = configKeys.map((ck) => {
+        const m = resultsByConfig.get(ck)?.get(pLabel)
+        if (!m) return null
+        return metric.key === 'max_drawdown'
+          ? (numericValue(m.max_drawdown) != null ? Math.abs(numericValue(m.max_drawdown)) : null)
+          : numericValue(m[metric.key])
+      })
+      // For max_drawdown (displayed as abs), lower abs is better → higherIsBetter=false
+      const isHigher = metric.key === 'max_drawdown' ? false : metric.higher
+      const ranks = denseRank(rawValues, isHigher)
+      for (let i = 0; i < configKeys.length; i++) {
+        const ck = configKeys[i]
+        const map = perPresetRanks.get(ck)
+        if (!map.has(pLabel)) map.set(pLabel, [])
+        if (ranks[i] != null) map.get(pLabel).push(ranks[i])
+      }
+    }
+  }
+
+  // Compute per-preset average rank and overall average
+  const scores = new Map() // configKey → { presetAvg: Map<label, number>, overall: number }
+  for (const ck of configKeys) {
+    const presetAvg = new Map()
+    const allAvgs = []
+    for (const pLabel of presetLabels) {
+      const ranks = perPresetRanks.get(ck)?.get(pLabel) ?? []
+      if (ranks.length > 0) {
+        const avg = ranks.reduce((a, b) => a + b, 0) / ranks.length
+        presetAvg.set(pLabel, avg)
+        allAvgs.push(avg)
+      }
+    }
+    const overall = allAvgs.length > 0
+      ? allAvgs.reduce((a, b) => a + b, 0) / allAvgs.length
+      : null
+    scores.set(ck, { presetAvg, overall })
+  }
+
+  return scores
+}
+
 // Renders a single right-aligned delta cell with automatic sign + color.
 function DeltaCell({ value, format }) {
   if (value == null) {
@@ -227,6 +358,7 @@ export default function ScreenerRotation() {
   const [singleResult, setSingleResult] = useState(null)
   const [comparisonResult, setComparisonResult] = useState(null)
   const [sweepResult, setSweepResult] = useState(null)
+  const [crossPresetResult, setCrossPresetResult] = useState(null)
 
   const setField = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }))
@@ -248,6 +380,7 @@ export default function ScreenerRotation() {
     setSingleResult(null)
     setComparisonResult(null)
     setSweepResult(null)
+    setCrossPresetResult(null)
 
     try {
       const basePayload = buildBasePayload(form)
@@ -279,7 +412,7 @@ export default function ScreenerRotation() {
         // Build the full experiment grid: top_n × defensive_mode
         const experiments = topNValues.flatMap((topN) =>
           defensiveModes.map((defMode) => ({
-            label: `top_n=${topN} / ${defMode === 'cash' ? 'cash' : 'defensive'}`,
+            label: `Top ${topN} · ${defMode === 'cash' ? 'Cash' : 'Defensive'}`,
             top_n: topN,
             defensive_mode: defMode,
             payload: { ...basePayload, top_n: topN, defensive_mode: defMode },
@@ -304,6 +437,43 @@ export default function ScreenerRotation() {
         const benchmark = firstOk?.result?.benchmark ?? null
 
         setSweepResult({ rows, benchmark, totalRuns: experiments.length })
+      } else if (form.run_mode === 'cross_preset') {
+        const topNValues = parseSweepTopN(form.sweep_top_n)
+        const defensiveModes = ['cash', 'defensive_asset']
+
+        // Build all experiment jobs: preset × top_n × defensive_mode
+        const jobs = PRESET_WINDOWS.flatMap((preset) =>
+          topNValues.flatMap((topN) =>
+            defensiveModes.map((defMode) => ({
+              presetLabel: preset.label,
+              configKey: `Top ${topN} · ${defMode === 'cash' ? 'Cash' : 'Defensive'}`,
+              top_n: topN,
+              defensive_mode: defMode,
+              payload: {
+                ...basePayload,
+                date_from: preset.date_from,
+                date_to: preset.date_to,
+                top_n: topN,
+                defensive_mode: defMode,
+              },
+            }))
+          )
+        )
+
+        const settled = await Promise.allSettled(
+          jobs.map((job) => runScreenerRotation(job.payload))
+        )
+
+        const results = jobs.map((job, i) => ({
+          ...job,
+          status: settled[i].status,
+          result: settled[i].status === 'fulfilled' ? settled[i].value : null,
+          error: settled[i].status === 'rejected'
+            ? (settled[i].reason?.message ?? 'request failed')
+            : null,
+        }))
+
+        setCrossPresetResult({ results, totalRuns: jobs.length })
       } else {
         const data = await runScreenerRotation({
           ...basePayload,
@@ -430,6 +600,7 @@ export default function ScreenerRotation() {
                 <option value="single">Single run</option>
                 <option value="compare_variants">Compare variants</option>
                 <option value="parameter_sweep">Parameter sweep</option>
+                <option value="cross_preset">Cross-preset ranking</option>
               </select>
             </div>
           </div>
@@ -446,40 +617,103 @@ export default function ScreenerRotation() {
             />
           </div>
 
-          <div className="form-row">
+          {/* ── Preset windows (hidden in cross-preset — it runs all automatically) ── */}
+          {form.run_mode !== 'cross_preset' && (
             <div className="field">
-              <label>From *</label>
-              <input
-                type="date"
-                value={form.date_from}
-                onChange={(event) => setField('date_from', event.target.value)}
-                required
-                disabled={loading}
-              />
+              <label>Preset windows</label>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {PRESET_WINDOWS.map((preset) => {
+                  const active =
+                    form.date_from === preset.date_from &&
+                    form.date_to   === preset.date_to
+                  return (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      disabled={loading}
+                      title={preset.note}
+                      onClick={() => {
+                        setField('date_from', preset.date_from)
+                        setField('date_to',   preset.date_to)
+                      }}
+                      style={{
+                        padding:       '4px 12px',
+                        fontSize:      12,
+                        fontWeight:    active ? 700 : 400,
+                        borderRadius:  4,
+                        border:        active
+                          ? '1px solid var(--accent)'
+                          : '1px solid var(--border)',
+                        background:    active
+                          ? 'rgba(79,142,247,0.15)'
+                          : 'var(--surface)',
+                        color:         active ? 'var(--accent)' : 'var(--muted)',
+                        cursor:        loading ? 'not-allowed' : 'pointer',
+                        whiteSpace:    'nowrap',
+                      }}
+                    >
+                      {preset.label}
+                      <span style={{ marginLeft: 6, opacity: 0.55, fontFamily: 'monospace' }}>
+                        {preset.date_from.slice(0, 4)}–{preset.date_to.slice(0, 4)}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
             </div>
-            <div className="field">
-              <label>To *</label>
-              <input
-                type="date"
-                value={form.date_to}
-                onChange={(event) => setField('date_to', event.target.value)}
-                required
-                disabled={loading}
-              />
-            </div>
-            {form.run_mode !== 'parameter_sweep' ? (
-              <div className="field" style={{ maxWidth: 120 }}>
-                <label>Top N</label>
+          )}
+
+          {form.run_mode !== 'cross_preset' && (
+            <div className="form-row">
+              <div className="field">
+                <label>From *</label>
                 <input
-                  type="number"
-                  min="1"
-                  max="20"
-                  value={form.top_n}
-                  onChange={(event) => setField('top_n', event.target.value)}
+                  type="date"
+                  value={form.date_from}
+                  onChange={(event) => setField('date_from', event.target.value)}
+                  required
                   disabled={loading}
                 />
               </div>
-            ) : (
+              <div className="field">
+                <label>To *</label>
+                <input
+                  type="date"
+                  value={form.date_to}
+                  onChange={(event) => setField('date_to', event.target.value)}
+                  required
+                  disabled={loading}
+                />
+              </div>
+              {form.run_mode !== 'parameter_sweep' ? (
+                <div className="field" style={{ maxWidth: 120 }}>
+                  <label>Top N</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="20"
+                    value={form.top_n}
+                    onChange={(event) => setField('top_n', event.target.value)}
+                    disabled={loading}
+                  />
+                </div>
+              ) : (
+                <div className="field" style={{ maxWidth: 220 }}>
+                  <label>Top N values (comma-separated)</label>
+                  <input
+                    type="text"
+                    value={form.sweep_top_n}
+                    onChange={(event) => setField('sweep_top_n', event.target.value)}
+                    placeholder="1,2,3"
+                    spellCheck={false}
+                    disabled={loading}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+          {form.run_mode === 'cross_preset' && (
+            <div className="form-row">
               <div className="field" style={{ maxWidth: 220 }}>
                 <label>Top N values (comma-separated)</label>
                 <input
@@ -491,8 +725,8 @@ export default function ScreenerRotation() {
                   disabled={loading}
                 />
               </div>
-            )}
-          </div>
+            </div>
+          )}
 
           <div className="form-row">
             <div className="field">
@@ -539,18 +773,20 @@ export default function ScreenerRotation() {
           </div>
 
           <div className="form-row">
-            <div className="field" style={{ maxWidth: 220 }}>
-              <label>Defensive behavior</label>
-              <select
-                value={form.defensive_mode}
-                onChange={(event) => setField('defensive_mode', event.target.value)}
-                disabled={loading || form.run_mode === 'compare_variants' || form.run_mode === 'parameter_sweep'}
-                style={(form.run_mode === 'compare_variants' || form.run_mode === 'parameter_sweep') ? { opacity: 0.6 } : undefined}
-              >
-                <option value="cash">Stay in cash</option>
-                <option value="defensive_asset">Use defensive asset</option>
-              </select>
-            </div>
+            {form.run_mode !== 'parameter_sweep' && form.run_mode !== 'cross_preset' && (
+              <div className="field" style={{ maxWidth: 220 }}>
+                <label>Defensive behavior</label>
+                <select
+                  value={form.defensive_mode}
+                  onChange={(event) => setField('defensive_mode', event.target.value)}
+                  disabled={loading || form.run_mode === 'compare_variants'}
+                  style={form.run_mode === 'compare_variants' ? { opacity: 0.6 } : undefined}
+                >
+                  <option value="cash">Stay in cash</option>
+                  <option value="defensive_asset">Use defensive asset</option>
+                </select>
+              </div>
+            )}
             <div className="field">
               <label>Defensive tickers priority</label>
               <input
@@ -571,13 +807,25 @@ export default function ScreenerRotation() {
           )}
           {form.run_mode === 'parameter_sweep' && (
             <div style={{ marginBottom: 12, color: 'var(--muted)', fontSize: 13 }}>
-              Sweep mode runs every combination of Top N × defensive mode automatically.
-              Each value in the Top N list is combined with both cash and defensive_asset.
+              Each Top N value is run twice — once with cash and once with defensive asset.
               {' '}<strong style={{ color: 'var(--text)' }}>
-                {parseSweepTopN(form.sweep_top_n).length * 2} experiment{parseSweepTopN(form.sweep_top_n).length * 2 !== 1 ? 's' : ''} will run.
+                {parseSweepTopN(form.sweep_top_n).length * 2} experiment{parseSweepTopN(form.sweep_top_n).length * 2 !== 1 ? 's' : ''} will run in parallel.
               </strong>
             </div>
           )}
+          {form.run_mode === 'cross_preset' && (() => {
+            const nConfigs = parseSweepTopN(form.sweep_top_n).length * 2
+            const nTotal = PRESET_WINDOWS.length * nConfigs
+            return (
+              <div style={{ marginBottom: 12, color: 'var(--muted)', fontSize: 13 }}>
+                Runs every Top N × defensive mode combination across all {PRESET_WINDOWS.length} preset windows
+                ({PRESET_WINDOWS.map((p) => p.label).join(', ')}).
+                {' '}<strong style={{ color: 'var(--text)' }}>
+                  {nTotal} experiment{nTotal !== 1 ? 's' : ''} will run in parallel.
+                </strong>
+              </div>
+            )
+          })()}
 
           {formError && <div className="field-error">{formError}</div>}
 
@@ -588,7 +836,9 @@ export default function ScreenerRotation() {
                 ? 'Run Comparison'
                 : form.run_mode === 'parameter_sweep'
                   ? 'Run Sweep'
-                  : 'Run Backtest'}
+                  : form.run_mode === 'cross_preset'
+                    ? 'Run Cross-Preset Ranking'
+                    : 'Run Backtest'}
             </button>
           </div>
         </form>
@@ -596,9 +846,9 @@ export default function ScreenerRotation() {
         {error && <div className="alert alert-error" style={{ marginTop: 12 }}>{error}</div>}
       </div>
 
-      {!singleResult && !comparisonResult && !sweepResult && !loading && !error && (
+      {!singleResult && !comparisonResult && !sweepResult && !crossPresetResult && !loading && !error && (
         <div className="empty" style={{ paddingTop: 40 }}>
-          Configure the parameters above and run a single backtest, compare both variants, or run a parameter sweep.
+          Configure the parameters above and choose a run mode.
         </div>
       )}
 
@@ -608,7 +858,9 @@ export default function ScreenerRotation() {
             ? 'Running both Screener Rotation variants. The comparison table will appear only after both finish successfully.'
             : form.run_mode === 'parameter_sweep'
               ? `Running ${parseSweepTopN(form.sweep_top_n).length * 2} sweep experiments in parallel. Results will appear after all runs complete.`
-              : 'Running screener rotation backtest...'}
+              : form.run_mode === 'cross_preset'
+                ? `Running ${PRESET_WINDOWS.length * parseSweepTopN(form.sweep_top_n).length * 2} experiments across ${PRESET_WINDOWS.length} preset windows. This may take a moment.`
+                : 'Running screener rotation backtest...'}
         </div>
       )}
 
@@ -898,6 +1150,306 @@ export default function ScreenerRotation() {
               </>
             )}
           </div>
+        )
+      })()}
+
+      {/* ── Cross-preset ranking results ────────────────────────────────────── */}
+      {crossPresetResult && (() => {
+        const { results, totalRuns } = crossPresetResult
+        const failed  = results.filter((r) => r.status === 'rejected')
+        const success = results.filter((r) => r.status === 'fulfilled')
+
+        // Unique config keys (e.g. "Top 1 · Cash") preserving grid order
+        const configKeys = []
+        for (const r of results) {
+          if (!configKeys.includes(r.configKey)) configKeys.push(r.configKey)
+        }
+
+        // resultsByConfig: Map<configKey, Map<presetLabel, metrics>>
+        const resultsByConfig = new Map()
+        for (const r of success) {
+          if (!resultsByConfig.has(r.configKey)) resultsByConfig.set(r.configKey, new Map())
+          resultsByConfig.get(r.configKey).set(r.presetLabel, r.result.metrics)
+        }
+
+        const scores = computeCrossPresetRanking(configKeys, resultsByConfig)
+
+        // Sort by overall score ascending (best first)
+        const ranked = configKeys
+          .map((ck) => ({ configKey: ck, score: scores.get(ck)?.overall ?? 999 }))
+          .sort((a, b) => a.score - b.score)
+
+        // Category winners
+        const bestByPreset = new Map()
+        for (const pLabel of PRESET_WINDOWS.map((p) => p.label)) {
+          let best = null
+          let bestAvg = 999
+          for (const ck of configKeys) {
+            const avg = scores.get(ck)?.presetAvg?.get(pLabel)
+            if (avg != null && avg < bestAvg) { bestAvg = avg; best = ck }
+          }
+          if (best) bestByPreset.set(pLabel, best)
+        }
+
+        // Best risk-adjusted: best average sharpe rank across presets
+        let bestRiskAdj = null
+        let bestRiskVal = 999
+        for (const ck of configKeys) {
+          const sharpes = PRESET_WINDOWS.map((p) => {
+            const m = resultsByConfig.get(ck)?.get(p.label)
+            return m ? numericValue(m.sharpe_ratio) : null
+          }).filter((v) => v != null)
+          if (sharpes.length > 0) {
+            const avg = sharpes.reduce((a, b) => a + b, 0) / sharpes.length
+            if (avg > bestRiskVal || bestRiskAdj === null) { bestRiskVal = avg; bestRiskAdj = ck }
+          }
+        }
+
+        // Best drawdown control: lowest average |max_drawdown| across presets
+        let bestDD = null
+        let bestDDVal = 999
+        for (const ck of configKeys) {
+          const dds = PRESET_WINDOWS.map((p) => {
+            const m = resultsByConfig.get(ck)?.get(p.label)
+            return m ? numericValue(m.max_drawdown) : null
+          }).filter((v) => v != null).map((v) => Math.abs(v))
+          if (dds.length > 0) {
+            const avg = dds.reduce((a, b) => a + b, 0) / dds.length
+            if (avg < bestDDVal) { bestDDVal = avg; bestDD = ck }
+          }
+        }
+
+        const WINNER_STYLE = {
+          display: 'inline-block',
+          padding: '3px 10px',
+          borderRadius: 4,
+          fontSize: 12,
+          fontWeight: 700,
+          background: 'rgba(34, 197, 94, 0.12)',
+          color: 'var(--success)',
+          border: '1px solid rgba(34, 197, 94, 0.3)',
+        }
+
+        return (
+          <>
+            {/* Failures */}
+            {failed.length > 0 && (
+              <div className="card">
+                <div className="alert alert-error" style={{ margin: 0 }}>
+                  <strong>{failed.length} of {totalRuns} experiment{failed.length !== 1 ? 's' : ''} failed:</strong>
+                  <ul style={{ margin: '6px 0 0 0', paddingLeft: 18 }}>
+                    {failed.map((r, i) => (
+                      <li key={i} style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                        [{r.presetLabel}] {r.configKey} — {r.error}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            )}
+
+            {success.length === 0 ? (
+              <div className="empty">All {totalRuns} experiments failed. Check the errors above.</div>
+            ) : (
+              <>
+                {/* ── Global ranking summary ── */}
+                <div className="card">
+                  <div className="card-title">
+                    Global ranking — {totalRuns} experiments across {PRESET_WINDOWS.length} market regimes
+                  </div>
+
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+                    gap: 12,
+                    marginBottom: 20,
+                  }}>
+                    <div className="metric-box">
+                      <div className="metric-label">Overall winner</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{ranked[0]?.configKey ?? '—'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        avg rank {ranked[0]?.score?.toFixed(2) ?? '—'}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Best in bull market</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestByPreset.get('Bull run') ?? '—'}</span>
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Best in bear market</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestByPreset.get('Rate hike bear') ?? '—'}</span>
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Best risk-adjusted</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestRiskAdj ?? '—'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        avg Sharpe {bestRiskVal !== 999 ? bestRiskVal.toFixed(2) : '—'}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Best drawdown control</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestDD ?? '—'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        avg |DD| {bestDDVal !== 999 ? absPct(bestDDVal) : '—'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ── Overall ranking table (sorted by average rank) ── */}
+                  <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
+                    Overall ranking — lower average rank is better
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th style={{ width: 28 }}>#</th>
+                          <th>Configuration</th>
+                          {PRESET_WINDOWS.map((p) => (
+                            <th key={p.label} style={{ textAlign: 'right' }}>
+                              {p.label}
+                            </th>
+                          ))}
+                          <th style={{ textAlign: 'right' }}>Avg rank</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {ranked.map((row, i) => {
+                          const s = scores.get(row.configKey)
+                          const isWinner = i === 0
+                          return (
+                            <tr
+                              key={row.configKey}
+                              style={isWinner
+                                ? { background: 'rgba(34, 197, 94, 0.06)' }
+                                : undefined}
+                            >
+                              <td style={{ color: 'var(--muted)', fontSize: 12 }}>{i + 1}</td>
+                              <td>
+                                <strong style={{ color: isWinner ? 'var(--success)' : 'var(--text)' }}>
+                                  {row.configKey}
+                                </strong>
+                              </td>
+                              {PRESET_WINDOWS.map((p) => {
+                                const avg = s?.presetAvg?.get(p.label)
+                                const isBest = bestByPreset.get(p.label) === row.configKey
+                                return (
+                                  <td
+                                    key={p.label}
+                                    style={{
+                                      textAlign: 'right',
+                                      fontFamily: 'monospace',
+                                      ...(isBest ? BEST_CELL_STYLE : {}),
+                                    }}
+                                  >
+                                    {avg != null ? avg.toFixed(2) : '—'}
+                                  </td>
+                                )
+                              })}
+                              <td style={{
+                                textAlign: 'right',
+                                fontFamily: 'monospace',
+                                fontWeight: 700,
+                                color: isWinner ? 'var(--success)' : 'var(--text)',
+                              }}>
+                                {row.score != null && row.score < 999 ? row.score.toFixed(2) : '—'}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 12, color: 'var(--muted)' }}>
+                    Each cell shows the average metric rank (across CAGR, Sharpe, Max DD, Calmar) within that preset window. Lower is better.
+                    Green highlights mark the best configuration per regime.
+                  </div>
+                </div>
+
+                {/* ── Detailed metrics per preset ── */}
+                {PRESET_WINDOWS.map((preset) => {
+                  const presetRows = configKeys
+                    .map((ck) => ({
+                      configKey: ck,
+                      metrics: resultsByConfig.get(ck)?.get(preset.label) ?? null,
+                    }))
+                    .filter((r) => r.metrics != null)
+                    .map((r) => ({
+                      key: r.configKey,
+                      label: r.configKey,
+                      isBenchmark: false,
+                      metrics: r.metrics,
+                    }))
+
+                  if (!presetRows.length) return null
+
+                  return (
+                    <div className="card" key={preset.label}>
+                      <div className="card-title">
+                        {preset.label}
+                        <span style={{ fontWeight: 400, color: 'var(--muted)', marginLeft: 8, fontFamily: 'monospace', fontSize: 12 }}>
+                          {preset.date_from} → {preset.date_to}
+                        </span>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Configuration</th>
+                              <th style={{ textAlign: 'right' }}>Final equity</th>
+                              <th style={{ textAlign: 'right' }}>CAGR</th>
+                              <th style={{ textAlign: 'right' }}>Sharpe</th>
+                              <th style={{ textAlign: 'right' }}>Max DD</th>
+                              <th style={{ textAlign: 'right' }}>Calmar</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {presetRows.map((row) => {
+                              const m = row.metrics
+                              const best = (key, pref, val) =>
+                                isBestMetric(presetRows, key, pref, val) ? BEST_CELL_STYLE : {}
+                              return (
+                                <tr key={row.key}>
+                                  <td>
+                                    <strong>{row.label}</strong>
+                                  </td>
+                                  <td style={{ textAlign: 'right', fontFamily: 'monospace', ...best('final_equity', 'higher', m.final_equity) }}>
+                                    ${fmt(m.final_equity)}
+                                  </td>
+                                  <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(m.cagr), ...best('cagr', 'higher', m.cagr) }}>
+                                    {pct(m.cagr)}
+                                  </td>
+                                  <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(m.sharpe_ratio), ...best('sharpe_ratio', 'higher', m.sharpe_ratio) }}>
+                                    {fmt(m.sharpe_ratio)}
+                                  </td>
+                                  <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--error)', ...best('max_drawdown', 'lower', m.max_drawdown) }}>
+                                    {absPct(m.max_drawdown)}
+                                  </td>
+                                  <td style={{ textAlign: 'right', fontFamily: 'monospace', ...best('calmar_ratio', 'higher', m.calmar_ratio) }}>
+                                    {fmt(m.calmar_ratio)}
+                                  </td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )
+                })}
+              </>
+            )}
+          </>
         )
       })()}
 
