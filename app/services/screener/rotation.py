@@ -92,6 +92,8 @@ def run_rotation(
     initial_capital: float,
     commission_bps: float,
     eval_start_date: date | None = None,
+    defensive_mode: str = "cash",
+    defensive_tickers: list[str] | None = None,
 ) -> dict:
     """Run a monthly screener rotation backtest.
 
@@ -111,6 +113,8 @@ def run_rotation(
                         trades, metrics, warmup_bars_available
     """
     commission_rate = commission_bps / 10_000
+    defensive_priority = [ticker.strip().upper() for ticker in (defensive_tickers or []) if ticker.strip()]
+    defensive_set = set(defensive_priority)
 
     # ── Union of all trading dates present in the filtered range ─────────────
     all_dates: list[date] = sorted(
@@ -186,20 +190,46 @@ def run_rotation(
             }
             _, ranked = score_universe(slice_dfs, top_n)
 
-            # Eligible assets: correct label, sufficient quality, have a price today
-            eligible = [
+            # Risk-on candidates exclude configured defensive tickers.
+            risk_on_eligible = [
                 r for r in ranked
                 if r["label"]        in _ELIGIBLE_LABELS
                 and r["data_quality"] in _ELIGIBLE_QUALITY
                 and r["ticker"]       in prices
+                and r["ticker"] not in defensive_set
             ][:top_n]
 
-            # Build target weights from screener output
-            new_weights: dict[str, float] = {
-                r["ticker"]: (r.get("suggested_weight") or 0.0)
-                for r in eligible
-                if (r.get("suggested_weight") or 0.0) > 0
+            defensive_candidates = {
+                r["ticker"]: r
+                for r in ranked
+                if r["label"] in _ELIGIBLE_LABELS
+                and r["data_quality"] in _ELIGIBLE_QUALITY
+                and r["ticker"] in prices
+                and r["ticker"] in defensive_set
             }
+
+            allocation_mode = "cash"
+            selected_tickers: list[str] = []
+
+            # Build target weights from screener output
+            new_weights: dict[str, float] = {}
+            if risk_on_eligible:
+                allocation_mode = "risk_on"
+                new_weights = {
+                    r["ticker"]: (r.get("suggested_weight") or 0.0)
+                    for r in risk_on_eligible
+                    if (r.get("suggested_weight") or 0.0) > 0
+                }
+                selected_tickers = list(new_weights.keys())
+            elif defensive_mode == "defensive_asset":
+                fallback_ticker = next(
+                    (ticker for ticker in defensive_priority if ticker in defensive_candidates),
+                    None,
+                )
+                if fallback_ticker is not None:
+                    allocation_mode = "defensive"
+                    new_weights = {fallback_ticker: 1.0}
+                    selected_tickers = [fallback_ticker]
 
             # Renormalise only if cap-rounding pushed sum meaningfully off 1.0
             total_w = sum(new_weights.values())
@@ -247,10 +277,11 @@ def run_rotation(
 
             rebalance_log.append({
                 "date":              str(current_date),
-                "eligible_count":    len(eligible),
+                "eligible_count":    len(risk_on_eligible),
                 "cash_only":         len(new_weights) == 0,
-                "selected_tickers":  list(new_weights.keys()),
+                "selected_tickers":  selected_tickers,
                 "weights":           {t: round(w, 4) for t, w in new_weights.items()},
+                "allocation_mode":   allocation_mode,
             })
 
         # ── Daily equity snapshot (end of day) ────────────────────────────────

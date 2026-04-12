@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { runScreenerRotation } from '../api.js'
 
 const DEFAULT = {
+  run_mode: 'single',
   instrument_tickers: 'SPY, QQQ, IWM, TLT, GLD',
   date_from: '2021-01-01',
   date_to: '2023-12-31',
@@ -10,10 +11,19 @@ const DEFAULT = {
   commission_bps: '10',
   rebalance_frequency: 'monthly',
   warmup_bars: '252',
+  defensive_mode: 'cash',
+  defensive_tickers: 'TLT, GLD',
 }
 
 const STRATEGY_COLOR = 'var(--success)'
 const BENCHMARK_COLOR = '#60a5fa'
+const CASH_COLOR = '#f59e0b'
+const DEFENSIVE_COLOR = '#22c55e'
+const BEST_CELL_STYLE = {
+  background: 'rgba(34, 197, 94, 0.10)',
+  color: 'var(--success)',
+  fontWeight: 700,
+}
 
 function fmt(value, decimals = 2) {
   if (value == null || value === '') return '-'
@@ -72,8 +82,28 @@ function buildEquityCurvePoints(points, width, height, padding, lookup, count, m
     .join(' ')
 }
 
+function parseTickerList(value) {
+  return value
+    .split(',')
+    .map((ticker) => ticker.trim().toUpperCase())
+    .filter(Boolean)
+}
+
+function allocationLabel(mode) {
+  if (mode === 'risk_on') return 'Risk-on'
+  if (mode === 'defensive') return 'Defensive'
+  return 'Cash'
+}
+
+function calcCalmar(cagr, maxDrawdown) {
+  const c = Number(cagr)
+  const md = Number(maxDrawdown)
+  if (!Number.isFinite(c) || !Number.isFinite(md) || md === 0) return null
+  return c / Math.abs(md)
+}
+
 function validate(form) {
-  const tickers = form.instrument_tickers.split(',').map((value) => value.trim()).filter(Boolean)
+  const tickers = parseTickerList(form.instrument_tickers)
   if (!tickers.length) return 'At least one ticker is required.'
   if (!form.date_from) return '"From" date is required.'
   if (!form.date_to) return '"To" date is required.'
@@ -82,7 +112,53 @@ function validate(form) {
   if (Number(form.initial_capital) <= 0) return 'Initial capital must be > 0.'
   if (Number(form.commission_bps) < 0) return 'Commission must be >= 0.'
   if (Number(form.warmup_bars) < 0) return 'Warm-up bars must be >= 0.'
+  if (
+    (form.run_mode === 'compare_variants' || form.defensive_mode === 'defensive_asset')
+    && parseTickerList(form.defensive_tickers).length === 0
+  ) {
+    return 'Add at least one defensive ticker for defensive-asset comparisons.'
+  }
   return null
+}
+
+function buildBasePayload(form) {
+  return {
+    instrument_tickers: parseTickerList(form.instrument_tickers),
+    date_from: form.date_from,
+    date_to: form.date_to,
+    top_n: Math.max(1, Math.min(20, parseInt(form.top_n, 10) || 3)),
+    initial_capital: Number(form.initial_capital),
+    commission_bps: Number(form.commission_bps),
+    rebalance_frequency: form.rebalance_frequency,
+    warmup_bars: Math.max(0, Math.min(1000, parseInt(form.warmup_bars, 10) || 252)),
+    defensive_tickers: parseTickerList(form.defensive_tickers),
+  }
+}
+
+function numericValue(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function getBestValue(rows, metricKey, preference) {
+  const values = rows
+    .map((row) => {
+      const value = numericValue(row.metrics[metricKey])
+      if (value == null) return null
+      return metricKey === 'max_drawdown' ? Math.abs(value) : value
+    })
+    .filter((value) => value != null)
+
+  if (!values.length) return null
+  return preference === 'lower' ? Math.min(...values) : Math.max(...values)
+}
+
+function isBestMetric(rows, metricKey, preference, candidate) {
+  const bestValue = getBestValue(rows, metricKey, preference)
+  const currentValue = numericValue(candidate)
+  if (bestValue == null || currentValue == null) return false
+  const comparable = metricKey === 'max_drawdown' ? Math.abs(currentValue) : currentValue
+  return Math.abs(comparable - bestValue) < 1e-9
 }
 
 export default function ScreenerRotation() {
@@ -90,7 +166,8 @@ export default function ScreenerRotation() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [formError, setFormError] = useState(null)
-  const [result, setResult] = useState(null)
+  const [singleResult, setSingleResult] = useState(null)
+  const [comparisonResult, setComparisonResult] = useState(null)
 
   const setField = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }))
@@ -99,6 +176,7 @@ export default function ScreenerRotation() {
 
   const submit = async (event) => {
     event.preventDefault()
+    if (loading) return
 
     const validationError = validate(form)
     if (validationError) {
@@ -108,25 +186,39 @@ export default function ScreenerRotation() {
 
     setLoading(true)
     setError(null)
-    setResult(null)
+    setSingleResult(null)
+    setComparisonResult(null)
 
     try {
-      const payload = {
-        instrument_tickers: form.instrument_tickers
-          .split(',')
-          .map((value) => value.trim().toUpperCase())
-          .filter(Boolean),
-        date_from: form.date_from,
-        date_to: form.date_to,
-        top_n: Math.max(1, Math.min(20, parseInt(form.top_n, 10) || 3)),
-        initial_capital: Number(form.initial_capital),
-        commission_bps: Number(form.commission_bps),
-        rebalance_frequency: form.rebalance_frequency,
-        warmup_bars: Math.max(0, Math.min(1000, parseInt(form.warmup_bars, 10) || 252)),
-      }
+      const basePayload = buildBasePayload(form)
 
-      const data = await runScreenerRotation(payload)
-      setResult(data)
+      if (form.run_mode === 'compare_variants') {
+        const [cashVariant, defensiveVariant] = await Promise.allSettled([
+          runScreenerRotation({ ...basePayload, defensive_mode: 'cash' }),
+          runScreenerRotation({ ...basePayload, defensive_mode: 'defensive_asset' }),
+        ])
+
+        if (cashVariant.status !== 'fulfilled' || defensiveVariant.status !== 'fulfilled') {
+          const reasons = [
+            cashVariant.status !== 'fulfilled' ? `cash variant: ${cashVariant.reason?.message ?? 'request failed'}` : null,
+            defensiveVariant.status !== 'fulfilled' ? `defensive-asset variant: ${defensiveVariant.reason?.message ?? 'request failed'}` : null,
+          ].filter(Boolean)
+
+          throw new Error(`Comparison run failed. ${reasons.join(' | ')}`)
+        }
+
+        setComparisonResult({
+          cashVariant: cashVariant.value,
+          defensiveVariant: defensiveVariant.value,
+          benchmark: cashVariant.value.benchmark,
+        })
+      } else {
+        const data = await runScreenerRotation({
+          ...basePayload,
+          defensive_mode: form.defensive_mode,
+        })
+        setSingleResult(data)
+      }
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -134,6 +226,7 @@ export default function ScreenerRotation() {
     }
   }
 
+  const result = singleResult
   const metrics = result?.metrics ?? {}
   const benchmark = result?.benchmark ?? null
   const benchmarkCurve = benchmark?.equity_curve ?? []
@@ -142,6 +235,7 @@ export default function ScreenerRotation() {
   const trades = result?.trades ?? []
   const universe = result?.universe ?? []
   const cashOnlyCount = rebalanceLog.filter((row) => row.cash_only).length
+  const defensivePeriods = rebalanceLog.filter((row) => row.allocation_mode === 'defensive').length
 
   const chartWidth = 860
   const chartHeight = 260
@@ -173,6 +267,34 @@ export default function ScreenerRotation() {
     maxChartEquity,
   )
 
+  const comparisonRows = comparisonResult ? [
+    {
+      label: 'Rotation - cash',
+      color: CASH_COLOR,
+      metrics: comparisonResult.cashVariant.metrics,
+    },
+    {
+      label: 'Rotation - defensive asset',
+      color: DEFENSIVE_COLOR,
+      metrics: comparisonResult.defensiveVariant.metrics,
+    },
+    {
+      label: `${comparisonResult.benchmark?.ticker ?? 'SPY'} buy-and-hold`,
+      color: BENCHMARK_COLOR,
+      metrics: {
+        final_equity: comparisonResult.benchmark?.final_equity,
+        cagr: comparisonResult.benchmark?.cagr,
+        sharpe_ratio: comparisonResult.benchmark?.sharpe_ratio,
+        max_drawdown: comparisonResult.benchmark?.max_drawdown,
+        calmar_ratio: calcCalmar(
+          comparisonResult.benchmark?.cagr,
+          comparisonResult.benchmark?.max_drawdown,
+        ),
+        total_trades: 0,
+      },
+    },
+  ] : []
+
   return (
     <>
       <h2 className="section-title">Screener Rotation Backtest</h2>
@@ -180,6 +302,20 @@ export default function ScreenerRotation() {
       <div className="card">
         <div className="card-title">Configuration</div>
         <form className="form" onSubmit={submit}>
+          <div className="form-row">
+            <div className="field" style={{ maxWidth: 240 }}>
+              <label>Run mode</label>
+              <select
+                value={form.run_mode}
+                onChange={(event) => setField('run_mode', event.target.value)}
+                disabled={loading}
+              >
+                <option value="single">Single run</option>
+                <option value="compare_variants">Compare variants</option>
+              </select>
+            </div>
+          </div>
+
           <div className="field">
             <label>Tickers (comma-separated)</label>
             <input
@@ -188,6 +324,7 @@ export default function ScreenerRotation() {
               onChange={(event) => setField('instrument_tickers', event.target.value.toUpperCase())}
               placeholder="SPY, QQQ, IWM, TLT, GLD"
               spellCheck={false}
+              disabled={loading}
             />
           </div>
 
@@ -199,6 +336,7 @@ export default function ScreenerRotation() {
                 value={form.date_from}
                 onChange={(event) => setField('date_from', event.target.value)}
                 required
+                disabled={loading}
               />
             </div>
             <div className="field">
@@ -208,6 +346,7 @@ export default function ScreenerRotation() {
                 value={form.date_to}
                 onChange={(event) => setField('date_to', event.target.value)}
                 required
+                disabled={loading}
               />
             </div>
             <div className="field" style={{ maxWidth: 120 }}>
@@ -218,6 +357,7 @@ export default function ScreenerRotation() {
                 max="20"
                 value={form.top_n}
                 onChange={(event) => setField('top_n', event.target.value)}
+                disabled={loading}
               />
             </div>
           </div>
@@ -230,6 +370,7 @@ export default function ScreenerRotation() {
                 min="1"
                 value={form.initial_capital}
                 onChange={(event) => setField('initial_capital', event.target.value)}
+                disabled={loading}
               />
             </div>
             <div className="field" style={{ maxWidth: 160 }}>
@@ -239,6 +380,7 @@ export default function ScreenerRotation() {
                 min="0"
                 value={form.commission_bps}
                 onChange={(event) => setField('commission_bps', event.target.value)}
+                disabled={loading}
               />
             </div>
             <div className="field" style={{ maxWidth: 180 }}>
@@ -246,6 +388,7 @@ export default function ScreenerRotation() {
               <select
                 value={form.rebalance_frequency}
                 onChange={(event) => setField('rebalance_frequency', event.target.value)}
+                disabled={loading}
               >
                 <option value="monthly">monthly</option>
               </select>
@@ -258,16 +401,55 @@ export default function ScreenerRotation() {
                 max="1000"
                 value={form.warmup_bars}
                 onChange={(event) => setField('warmup_bars', event.target.value)}
+                disabled={loading}
               />
             </div>
           </div>
+
+          <div className="form-row">
+            <div className="field" style={{ maxWidth: 220 }}>
+              <label>Defensive behavior</label>
+              <select
+                value={form.defensive_mode}
+                onChange={(event) => setField('defensive_mode', event.target.value)}
+                disabled={loading || form.run_mode === 'compare_variants'}
+                style={form.run_mode === 'compare_variants' ? { opacity: 0.6 } : undefined}
+              >
+                <option value="cash">Stay in cash</option>
+                <option value="defensive_asset">Use defensive asset</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Defensive tickers priority</label>
+              <input
+                type="text"
+                value={form.defensive_tickers}
+                onChange={(event) => setField('defensive_tickers', event.target.value.toUpperCase())}
+                placeholder="TLT, GLD"
+                spellCheck={false}
+                disabled={loading}
+              />
+            </div>
+          </div>
+
+          {form.run_mode === 'compare_variants' && (
+            <div
+              style={{
+                marginBottom: 12,
+                color: 'var(--muted)',
+                fontSize: 13,
+              }}
+            >
+              Compare mode runs both rotation variants automatically: `cash` and `defensive_asset`.
+            </div>
+          )}
 
           {formError && <div className="field-error">{formError}</div>}
 
           <div>
             <button className="btn btn-primary" type="submit" disabled={loading}>
               {loading ? <span className="spinner" /> : null}
-              Run Backtest
+              {form.run_mode === 'compare_variants' ? 'Run Comparison' : 'Run Backtest'}
             </button>
           </div>
         </form>
@@ -275,15 +457,118 @@ export default function ScreenerRotation() {
         {error && <div className="alert alert-error" style={{ marginTop: 12 }}>{error}</div>}
       </div>
 
-      {!result && !loading && !error && (
+      {!singleResult && !comparisonResult && !loading && !error && (
         <div className="empty" style={{ paddingTop: 40 }}>
-          Configure the parameters above and click Run Backtest.
+          Configure the parameters above and run a single backtest or compare both variants.
         </div>
       )}
 
       {loading && (
         <div className="empty" style={{ paddingTop: 24 }}>
-          Running screener rotation backtest...
+          {form.run_mode === 'compare_variants'
+            ? 'Running both Screener Rotation variants. The comparison table will appear only after both finish successfully.'
+            : 'Running screener rotation backtest...'}
+        </div>
+      )}
+
+      {comparisonResult && (
+        <div className="card">
+          <div className="card-title">
+            Variant comparison - {comparisonResult.cashVariant.date_from} to {comparisonResult.cashVariant.date_to}
+          </div>
+          <div
+            style={{
+              marginBottom: 12,
+              color: 'var(--muted)',
+              fontSize: 13,
+            }}
+          >
+            Defensive tickers priority: <strong style={{ color: 'var(--text)' }}>{parseTickerList(form.defensive_tickers).join(', ')}</strong>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Variant</th>
+                  <th style={{ textAlign: 'right' }}>Final equity</th>
+                  <th style={{ textAlign: 'right' }}>CAGR</th>
+                  <th style={{ textAlign: 'right' }}>Sharpe</th>
+                  <th style={{ textAlign: 'right' }}>Max drawdown</th>
+                  <th style={{ textAlign: 'right' }}>Calmar</th>
+                  <th style={{ textAlign: 'right' }}>Total trades</th>
+                </tr>
+              </thead>
+              <tbody>
+                {comparisonRows.map((row) => (
+                  <tr key={row.label}>
+                    <td>
+                      <strong style={{ color: row.color }}>{row.label}</strong>
+                    </td>
+                    <td
+                      style={{
+                        textAlign: 'right',
+                        fontFamily: 'monospace',
+                        ...(isBestMetric(comparisonRows, 'final_equity', 'higher', row.metrics.final_equity) ? BEST_CELL_STYLE : {}),
+                      }}
+                    >
+                      ${fmt(row.metrics.final_equity)}
+                    </td>
+                    <td
+                      style={{
+                        textAlign: 'right',
+                        fontFamily: 'monospace',
+                        color: colorVal(row.metrics.cagr),
+                        ...(isBestMetric(comparisonRows, 'cagr', 'higher', row.metrics.cagr) ? BEST_CELL_STYLE : {}),
+                      }}
+                    >
+                      {pct(row.metrics.cagr)}
+                    </td>
+                    <td
+                      style={{
+                        textAlign: 'right',
+                        fontFamily: 'monospace',
+                        color: colorVal(row.metrics.sharpe_ratio),
+                        ...(isBestMetric(comparisonRows, 'sharpe_ratio', 'higher', row.metrics.sharpe_ratio) ? BEST_CELL_STYLE : {}),
+                      }}
+                    >
+                      {fmt(row.metrics.sharpe_ratio)}
+                    </td>
+                    <td
+                      style={{
+                        textAlign: 'right',
+                        fontFamily: 'monospace',
+                        color: 'var(--error)',
+                        ...(isBestMetric(comparisonRows, 'max_drawdown', 'lower', row.metrics.max_drawdown) ? BEST_CELL_STYLE : {}),
+                      }}
+                    >
+                      {absPct(row.metrics.max_drawdown)}
+                    </td>
+                    <td
+                      style={{
+                        textAlign: 'right',
+                        fontFamily: 'monospace',
+                        ...(isBestMetric(comparisonRows, 'calmar_ratio', 'higher', row.metrics.calmar_ratio) ? BEST_CELL_STYLE : {}),
+                      }}
+                    >
+                      {fmt(row.metrics.calmar_ratio)}
+                    </td>
+                    <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--muted)' }}>
+                      {row.metrics.total_trades ?? '-'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div
+            style={{
+              marginTop: 12,
+              color: 'var(--muted)',
+              fontSize: 13,
+            }}
+          >
+            Highlighted cells mark the best value in each metric column. `Total trades` stays neutral.
+          </div>
         </div>
       )}
 
@@ -335,9 +620,15 @@ export default function ScreenerRotation() {
                 <div className="metric-value">{rebalanceLog.length}</div>
               </div>
               <div className="metric-box">
-                <div className="metric-label">Cash-only periods</div>
+                <div className="metric-label">Cash periods</div>
                 <div className="metric-value" style={{ color: cashOnlyCount > 0 ? 'var(--warning)' : undefined }}>
                   {cashOnlyCount}
+                </div>
+              </div>
+              <div className="metric-box">
+                <div className="metric-label">Defensive periods</div>
+                <div className="metric-value" style={{ color: defensivePeriods > 0 ? BENCHMARK_COLOR : undefined }}>
+                  {defensivePeriods}
                 </div>
               </div>
             </div>
@@ -371,11 +662,14 @@ export default function ScreenerRotation() {
                 >
                   {result.warmup_bars_available} bars
                 </strong>
-                {result.warmup_bars_available < result.warmup_bars_requested && (
-                  <span style={{ color: 'var(--warning)', marginLeft: 8 }}>
-                    less than requested, so early rebalance signals may be weaker
-                  </span>
-                )}
+              </span>
+              <span>
+                Defensive rule:{' '}
+                <strong style={{ color: 'var(--text)' }}>
+                  {result.defensive_mode === 'defensive_asset'
+                    ? `first available of ${result.defensive_tickers.join(', ')}`
+                    : 'stay in cash'}
+                </strong>
               </span>
             </div>
           </div>
@@ -506,6 +800,7 @@ export default function ScreenerRotation() {
                   <thead>
                     <tr>
                       <th>Date</th>
+                      <th>Mode</th>
                       <th style={{ textAlign: 'right' }}>Eligible</th>
                       <th>Allocation</th>
                     </tr>
@@ -514,6 +809,11 @@ export default function ScreenerRotation() {
                     {rebalanceLog.map((row, index) => (
                       <tr key={index}>
                         <td style={{ fontFamily: 'monospace' }}>{row.date}</td>
+                        <td>
+                          <span style={{ color: row.allocation_mode === 'defensive' ? BENCHMARK_COLOR : 'var(--text)' }}>
+                            {allocationLabel(row.allocation_mode)}
+                          </span>
+                        </td>
                         <td
                           style={{
                             fontFamily: 'monospace',

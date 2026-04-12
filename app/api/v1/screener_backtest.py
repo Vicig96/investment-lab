@@ -69,6 +69,8 @@ async def run_screener_rotation(
         initial_capital=body.initial_capital,
         commission_bps=body.commission_bps,
         eval_start_date=body.date_from,
+        defensive_mode=body.defensive_mode,
+        defensive_tickers=body.defensive_tickers,
     )
     benchmark = run_buy_and_hold_benchmark(
         benchmark_df=benchmark_df,
@@ -86,6 +88,8 @@ async def run_screener_rotation(
         rebalance_frequency=body.rebalance_frequency,
         warmup_bars_requested=body.warmup_bars,
         warmup_bars_available=result["warmup_bars_available"],
+        defensive_mode=body.defensive_mode,
+        defensive_tickers=body.defensive_tickers,
         metrics=BacktestMetrics(**result["metrics"]),
         equity_curve=[EquityPoint(**e) for e in result["equity_curve"]],
         rebalance_log=[RebalanceEntry(**r) for r in result["rebalance_log"]],

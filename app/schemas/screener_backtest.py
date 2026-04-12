@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,8 @@ class ScreenerRotationRequest(BaseModel):
     commission_bps: float = Field(default=10.0, ge=0)
     rebalance_frequency: str = Field(default="monthly")
     warmup_bars: int = Field(default=252, ge=0, le=1000)
+    defensive_mode: Literal["cash", "defensive_asset"] = "cash"
+    defensive_tickers: list[str] = Field(default_factory=lambda: ["TLT", "GLD"])
 
 
 class RebalanceEntry(BaseModel):
@@ -25,6 +28,7 @@ class RebalanceEntry(BaseModel):
     cash_only: bool
     selected_tickers: list[str]
     weights: dict[str, float]
+    allocation_mode: Literal["risk_on", "defensive", "cash"]
 
 
 class HoldingSnapshot(BaseModel):
@@ -49,6 +53,8 @@ class ScreenerRotationResult(BaseModel):
     rebalance_frequency: str
     warmup_bars_requested: int
     warmup_bars_available: int
+    defensive_mode: Literal["cash", "defensive_asset"]
+    defensive_tickers: list[str]
     metrics: BacktestMetrics
     equity_curve: list[EquityPoint]
     rebalance_log: list[RebalanceEntry]
