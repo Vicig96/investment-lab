@@ -97,7 +97,6 @@ export default function Portfolio() {
     setRebResult(null)
     try {
       const weights = JSON.parse(reb.weights)
-      // Backend expects the weights dict directly (not wrapped in {target_weights: ...})
       const data = await rebalancePortfolio(weights, Number(reb.nav))
       setRebResult(data)
     } catch (err) {

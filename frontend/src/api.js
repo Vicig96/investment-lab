@@ -62,5 +62,4 @@ export const getBacktestResults = (id)   => get(`/backtest/${id}/results`)
 
 // ── Portfolio ─────────────────────────────────────────────────────────────────
 export const simulatePortfolio  = (body)          => post('/portfolio/simulate', body)
-// Backend expects the weights dict directly as the body, not wrapped
-export const rebalancePortfolio = (weights, nav)  => post(`/portfolio/rebalance?nav=${nav}`, weights)
+export const rebalancePortfolio = (weights, nav)  => post(`/portfolio/rebalance?nav=${nav}`, { target_weights: weights })
