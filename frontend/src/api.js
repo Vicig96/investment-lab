@@ -63,3 +63,9 @@ export const getBacktestResults = (id)   => get(`/backtest/${id}/results`)
 // ── Portfolio ─────────────────────────────────────────────────────────────────
 export const simulatePortfolio  = (body)          => post('/portfolio/simulate', body)
 export const rebalancePortfolio = (weights, nav)  => post(`/portfolio/rebalance?nav=${nav}`, { target_weights: weights })
+
+// ── Screener ──────────────────────────────────────────────────────────────────
+export const runScreener = (body) => post('/screener/run', body)
+
+// ── Screener Rotation Backtest ────────────────────────────────────────────────
+export const runScreenerRotation = (body) => post('/screener/rotation/run', body)

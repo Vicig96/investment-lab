@@ -6,6 +6,8 @@ import Indicators  from './components/Indicators.jsx'
 import Signals     from './components/Signals.jsx'
 import Backtest    from './components/Backtest.jsx'
 import Portfolio   from './components/Portfolio.jsx'
+import Screener         from './components/Screener.jsx'
+import ScreenerRotation from './components/ScreenerRotation.jsx'
 
 const TABS = [
   { id: 'instruments', label: 'Instruments' },
@@ -15,6 +17,8 @@ const TABS = [
   { id: 'signals',     label: 'Signals' },
   { id: 'backtest',    label: 'Backtest' },
   { id: 'portfolio',   label: 'Portfolio' },
+  { id: 'screener',          label: 'Screener' },
+  { id: 'screener-rotation', label: 'Rotation' },
 ]
 
 export default function App() {
@@ -45,6 +49,8 @@ export default function App() {
         {tab === 'signals'     && <Signals />}
         {tab === 'backtest'    && <Backtest />}
         {tab === 'portfolio'   && <Portfolio />}
+        {tab === 'screener'          && <Screener />}
+        {tab === 'screener-rotation' && <ScreenerRotation />}
       </main>
     </div>
   )
