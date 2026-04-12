@@ -161,6 +161,48 @@ function isBestMetric(rows, metricKey, preference, candidate) {
   return Math.abs(comparable - bestValue) < 1e-9
 }
 
+// ── Delta helpers ─────────────────────────────────────────────────────────────
+
+// Compute signed deltas between two metrics objects (a minus b).
+// Convention: positive always means "a is better than b" for that metric.
+//   equity / cagr / sharpe: higher is better → a - b
+//   max_drawdown:            lower abs is better → |b_dd| - |a_dd|
+function calcDeltas(aMetrics, bMetrics) {
+  const a = aMetrics ?? {}
+  const b = bMetrics ?? {}
+  const n = numericValue
+  const av = (k) => n(a[k])
+  const bv = (k) => n(b[k])
+
+  const eq = av('final_equity') != null && bv('final_equity') != null
+    ? av('final_equity') - bv('final_equity') : null
+  const cagr = av('cagr') != null && bv('cagr') != null
+    ? av('cagr') - bv('cagr') : null
+  const sharpe = av('sharpe_ratio') != null && bv('sharpe_ratio') != null
+    ? av('sharpe_ratio') - bv('sharpe_ratio') : null
+  // Positive = a had smaller drawdown = improvement over b
+  const dd = av('max_drawdown') != null && bv('max_drawdown') != null
+    ? Math.abs(bv('max_drawdown')) - Math.abs(av('max_drawdown')) : null
+
+  return { eq, cagr, sharpe, dd }
+}
+
+// Renders a single right-aligned delta cell with automatic sign + color.
+function DeltaCell({ value, format }) {
+  if (value == null) {
+    return (
+      <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--muted)' }}>—</td>
+    )
+  }
+  const color = value > 0 ? 'var(--success)' : value < 0 ? 'var(--error)' : 'var(--muted)'
+  const prefix = value > 0 ? '+' : ''
+  return (
+    <td style={{ textAlign: 'right', fontFamily: 'monospace', color }}>
+      {prefix}{format(value)}
+    </td>
+  )
+}
+
 export default function ScreenerRotation() {
   const [form, setForm] = useState(DEFAULT)
   const [loading, setLoading] = useState(false)
@@ -292,6 +334,31 @@ export default function ScreenerRotation() {
         ),
         total_trades: 0,
       },
+    },
+  ] : []
+
+  // Delta rows: signed differences, positive = first variant is better
+  const bmMetrics = comparisonResult ? {
+    final_equity: comparisonResult.benchmark?.final_equity,
+    cagr:         comparisonResult.benchmark?.cagr,
+    sharpe_ratio: comparisonResult.benchmark?.sharpe_ratio,
+    max_drawdown: comparisonResult.benchmark?.max_drawdown,
+  } : null
+  const deltaRows = comparisonResult ? [
+    {
+      label: 'Cash vs benchmark',
+      color: CASH_COLOR,
+      d: calcDeltas(comparisonResult.cashVariant.metrics, bmMetrics),
+    },
+    {
+      label: 'Defensive vs benchmark',
+      color: DEFENSIVE_COLOR,
+      d: calcDeltas(comparisonResult.defensiveVariant.metrics, bmMetrics),
+    },
+    {
+      label: 'Defensive vs cash',
+      color: 'var(--muted)',
+      d: calcDeltas(comparisonResult.defensiveVariant.metrics, comparisonResult.cashVariant.metrics),
     },
   ] : []
 
@@ -568,6 +635,55 @@ export default function ScreenerRotation() {
             }}
           >
             Highlighted cells mark the best value in each metric column. `Total trades` stays neutral.
+          </div>
+
+          {/* ── Deltas sub-table ── */}
+          <div style={{ marginTop: 24 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
+              Deltas — positive always means first variant is better
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Comparison</th>
+                    <th style={{ textAlign: 'right' }}>Δ Equity ($)</th>
+                    <th style={{ textAlign: 'right' }}>Δ CAGR (pp)</th>
+                    <th style={{ textAlign: 'right' }}>Δ Sharpe</th>
+                    <th style={{ textAlign: 'right' }}>Δ Max DD (pp)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {deltaRows.map((row) => (
+                    <tr key={row.label}>
+                      <td>
+                        <span style={{ color: row.color, fontWeight: 600 }}>{row.label}</span>
+                      </td>
+                      <DeltaCell
+                        value={row.d.eq}
+                        format={(v) => `$${v >= 0 ? '' : '-'}${Math.abs(v).toFixed(0)}`}
+                      />
+                      <DeltaCell
+                        value={row.d.cagr != null ? row.d.cagr * 100 : null}
+                        format={(v) => `${v.toFixed(2)}pp`}
+                      />
+                      <DeltaCell
+                        value={row.d.sharpe}
+                        format={(v) => v.toFixed(2)}
+                      />
+                      <DeltaCell
+                        value={row.d.dd != null ? row.d.dd * 100 : null}
+                        format={(v) => `${v.toFixed(2)}pp`}
+                      />
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ marginTop: 8, fontSize: 12, color: 'var(--muted)' }}>
+              Δ Max DD: positive = first variant had a smaller maximum drawdown.
+              pp = percentage points.
+            </div>
           </div>
         </div>
       )}
