@@ -1,66 +1,25 @@
 import uuid
 from datetime import datetime, timezone
 
-import pandas as pd
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select, func
 
 from app.core.dependencies import SessionDep
 from app.core.logging import get_logger
+from app.db.candles import load_ohlcv_multi
 from app.models.backtest_result import BacktestResult
 from app.models.backtest_run import BacktestRun
-from app.models.instrument import Instrument
-from app.models.price_candle import PriceCandle
 from app.schemas.backtest import (
     BacktestRequest,
     BacktestRunRead,
     BacktestResultRead,
     BacktestList,
-    EquityPoint,
-    TradeRecord,
 )
 from app.services.backtest.engine import BacktestEngine
 from app.services.signals.registry import get_strategy
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 logger = get_logger(__name__)
-
-
-async def _load_price_data(
-    session: SessionDep,
-    tickers: list[str],
-    date_from,
-    date_to,
-) -> dict[str, pd.DataFrame]:
-    price_data: dict[str, pd.DataFrame] = {}
-    for ticker in tickers:
-        inst_result = await session.execute(
-            select(Instrument).where(Instrument.ticker == ticker.upper())
-        )
-        instrument = inst_result.scalar_one_or_none()
-        if instrument is None:
-            raise HTTPException(status_code=404, detail=f"Instrument '{ticker}' not found.")
-
-        stmt = (
-            select(PriceCandle)
-            .where(PriceCandle.instrument_id == instrument.id)
-            .where(PriceCandle.date >= date_from)
-            .where(PriceCandle.date <= date_to)
-            .order_by(PriceCandle.date)
-        )
-        rows = (await session.execute(stmt)).scalars().all()
-        if not rows:
-            continue
-
-        df = pd.DataFrame(
-            [{"date": c.date, "open": float(c.open), "high": float(c.high),
-              "low": float(c.low), "close": float(c.close)}
-             for c in rows]
-        )
-        df.set_index("date", inplace=True)
-        price_data[ticker.upper()] = df
-
-    return price_data
 
 
 @router.post("/run", status_code=201)
@@ -84,7 +43,8 @@ async def run_backtest(body: BacktestRequest, session: SessionDep) -> dict:
     await session.flush()
 
     try:
-        price_data = await _load_price_data(
+        # load_ohlcv_multi uses 2 queries regardless of ticker count (no N+1)
+        price_data = await load_ohlcv_multi(
             session, body.instrument_tickers, body.date_from, body.date_to
         )
         if not price_data:
@@ -118,6 +78,11 @@ async def run_backtest(body: BacktestRequest, session: SessionDep) -> dict:
         run.status = "complete"
         run.completed_at = datetime.now(timezone.utc)
 
+    except HTTPException:
+        run.status = "error"
+        run.completed_at = datetime.now(timezone.utc)
+        await session.flush()
+        raise
     except Exception as exc:
         run.status = "error"
         run.error_message = str(exc)

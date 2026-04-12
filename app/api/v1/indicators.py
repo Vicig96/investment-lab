@@ -3,48 +3,13 @@ from datetime import date
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException
-from sqlalchemy import select
 
 from app.core.dependencies import SessionDep
-from app.models.price_candle import PriceCandle
+from app.db.candles import load_ohlcv_df
 from app.schemas.indicator import IndicatorResponse, IndicatorDataPoint, IndicatorListResponse, IndicatorInfo
 from app.services.indicators.registry import get_indicator, list_indicators
 
 router = APIRouter(tags=["indicators"])
-
-
-async def _load_candles_as_df(
-    session: SessionDep,
-    instrument_id: uuid.UUID,
-    from_date: date | None = None,
-    to_date: date | None = None,
-) -> pd.DataFrame:
-    stmt = select(PriceCandle).where(PriceCandle.instrument_id == instrument_id)
-    if from_date:
-        stmt = stmt.where(PriceCandle.date >= from_date)
-    if to_date:
-        stmt = stmt.where(PriceCandle.date <= to_date)
-    stmt = stmt.order_by(PriceCandle.date)
-    rows = (await session.execute(stmt)).scalars().all()
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        [
-            {
-                "date": c.date,
-                "open": float(c.open),
-                "high": float(c.high),
-                "low": float(c.low),
-                "close": float(c.close),
-                "volume": c.volume,
-            }
-            for c in rows
-        ]
-    )
-    df.set_index("date", inplace=True)
-    return df
 
 
 @router.get("/indicators", response_model=IndicatorListResponse)
@@ -87,7 +52,7 @@ async def compute_indicator(
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    df = await _load_candles_as_df(session, instrument_id, from_date, to_date)
+    df = await load_ohlcv_df(session, instrument_id, from_date, to_date)
     if df.empty:
         raise HTTPException(status_code=404, detail="No price data found for this instrument.")
 

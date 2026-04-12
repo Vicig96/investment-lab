@@ -44,3 +44,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+.claude/
+investlab.db
+.venv/
+__pycache__/
+.pytest_cache/

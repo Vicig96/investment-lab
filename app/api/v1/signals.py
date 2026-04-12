@@ -1,61 +1,17 @@
 import uuid
 from datetime import date
 
-import pandas as pd
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select, func
 
-from app.core.config import get_settings
 from app.core.dependencies import SessionDep
-from app.models.price_candle import PriceCandle
+from app.db.candles import load_ohlcv_df
+from app.db.upsert import build_upsert
 from app.models.signal import Signal
 from app.schemas.signal import SignalRunRequest, SignalRead, SignalList, StrategyInfo, StrategyListResponse
 from app.services.signals.registry import get_strategy, list_strategies
 
-
-def _build_signal_upsert(records: list[dict]):
-    """Dialect-aware INSERT … ON CONFLICT for signals."""
-    settings = get_settings()
-    if settings.is_sqlite:
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-        stmt = sqlite_insert(Signal).values(records)
-        return stmt.on_conflict_do_update(
-            index_elements=["instrument_id", "date", "strategy_name", "params"],
-            set_={"direction": stmt.excluded.direction},
-        )
-    else:
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-        stmt = pg_insert(Signal).values(records)
-        return stmt.on_conflict_do_update(
-            constraint="uq_signals_instrument_date_strategy_params",
-            set_={"direction": stmt.excluded.direction},
-        )
-
 router = APIRouter(tags=["signals"])
-
-
-async def _load_df(
-    session: SessionDep,
-    instrument_id: uuid.UUID,
-    from_date: date | None,
-    to_date: date | None,
-) -> pd.DataFrame:
-    stmt = select(PriceCandle).where(PriceCandle.instrument_id == instrument_id)
-    if from_date:
-        stmt = stmt.where(PriceCandle.date >= from_date)
-    if to_date:
-        stmt = stmt.where(PriceCandle.date <= to_date)
-    stmt = stmt.order_by(PriceCandle.date)
-    rows = (await session.execute(stmt)).scalars().all()
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(
-        [{"date": c.date, "open": float(c.open), "high": float(c.high),
-          "low": float(c.low), "close": float(c.close)}
-         for c in rows]
-    )
-    df.set_index("date", inplace=True)
-    return df
 
 
 @router.get("/strategies", response_model=StrategyListResponse)
@@ -72,21 +28,20 @@ async def run_signals(body: SignalRunRequest, session: SessionDep) -> dict:
 
     results: dict[str, list] = {}
     for instrument_id in body.instrument_ids:
-        df = await _load_df(session, instrument_id, body.date_from, body.date_to)
+        df = await load_ohlcv_df(session, instrument_id, body.date_from, body.date_to)
         if df.empty:
             results[str(instrument_id)] = []
             continue
 
         signal_series = strategy.generate(df)
 
-        signal_rows = [
+        results[str(instrument_id)] = [
             {
                 "date": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
                 "direction": int(v),
             }
             for idx, v in signal_series.items()
         ]
-        results[str(instrument_id)] = signal_rows
 
         if body.persist:
             records = [
@@ -100,7 +55,19 @@ async def run_signals(body: SignalRunRequest, session: SessionDep) -> dict:
                 for idx, v in signal_series.items()
             ]
             if records:
-                await session.execute(_build_signal_upsert(records))
+                # index_elements must match an existing unique index exactly.
+                # The Signal table has UniqueConstraint on all 4 columns.
+                # In SQLite, "params" is stored as TEXT — usable in a unique index.
+                # In PostgreSQL, the named constraint covers all 4 columns.
+                await session.execute(
+                    build_upsert(
+                        Signal,
+                        records,
+                        index_elements=["instrument_id", "date", "strategy_name", "params"],
+                        constraint_name="uq_signals_instrument_date_strategy_params",
+                        update_fields=["direction"],
+                    )
+                )
 
     return {"strategy": body.strategy_name, "results": results}
 

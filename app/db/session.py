@@ -9,17 +9,17 @@ from sqlalchemy.ext.asyncio import (
 from app.core.config import get_settings
 
 _settings = get_settings()
-_is_sqlite = _settings.database_url.startswith("sqlite")
 
 # SQLite (aiosqlite) does not support pool_size / max_overflow.
-# PostgreSQL (asyncpg) benefits from connection pooling.
+# Use NullPool for async SQLite — each session gets its own connection,
+# avoiding thread-safety issues with concurrent async tasks.
+# PostgreSQL (asyncpg) uses a standard connection pool.
 _engine_kwargs: dict = {"echo": _settings.debug}
 
-if _is_sqlite:
-    # StaticPool keeps a single connection — perfect for file-based SQLite in dev.
-    from sqlalchemy.pool import StaticPool
+if _settings.is_sqlite:
+    from sqlalchemy.pool import NullPool
     _engine_kwargs["connect_args"] = {"check_same_thread": False}
-    _engine_kwargs["poolclass"] = StaticPool
+    _engine_kwargs["poolclass"] = NullPool
 else:
     _engine_kwargs["pool_pre_ping"] = True
     _engine_kwargs["pool_size"] = 5

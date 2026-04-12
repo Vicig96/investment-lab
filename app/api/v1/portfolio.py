@@ -1,10 +1,10 @@
 from datetime import date
 
-import pandas as pd
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select, func
 
 from app.core.dependencies import SessionDep
+from app.db.candles import load_ohlcv_multi
 from app.models.instrument import Instrument
 from app.models.portfolio_snapshot import PortfolioSnapshot
 from app.models.price_candle import PriceCandle
@@ -22,38 +22,6 @@ from app.services.signals.registry import get_strategy
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
 
-async def _load_prices(
-    session: SessionDep, tickers: list[str], date_from: date, date_to: date
-) -> dict[str, pd.DataFrame]:
-    price_data: dict[str, pd.DataFrame] = {}
-    for ticker in tickers:
-        inst = (
-            await session.execute(select(Instrument).where(Instrument.ticker == ticker.upper()))
-        ).scalar_one_or_none()
-        if inst is None:
-            raise HTTPException(status_code=404, detail=f"Instrument '{ticker}' not found.")
-
-        rows = (
-            await session.execute(
-                select(PriceCandle)
-                .where(PriceCandle.instrument_id == inst.id)
-                .where(PriceCandle.date >= date_from)
-                .where(PriceCandle.date <= date_to)
-                .order_by(PriceCandle.date)
-            )
-        ).scalars().all()
-
-        if rows:
-            df = pd.DataFrame(
-                [{"date": c.date, "open": float(c.open), "high": float(c.high),
-                  "low": float(c.low), "close": float(c.close)}
-                 for c in rows]
-            )
-            df.set_index("date", inplace=True)
-            price_data[ticker.upper()] = df
-    return price_data
-
-
 @router.post("/simulate", status_code=201)
 async def simulate(body: PortfolioSimRequest, session: SessionDep) -> dict:
     try:
@@ -61,7 +29,8 @@ async def simulate(body: PortfolioSimRequest, session: SessionDep) -> dict:
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    price_data = await _load_prices(
+    # load_ohlcv_multi resolves all tickers in 2 queries (no N+1)
+    price_data = await load_ohlcv_multi(
         session, body.instrument_tickers, body.date_from, body.date_to
     )
     if not price_data:
@@ -118,21 +87,25 @@ async def rebalance(
 
     tickers = list(target_weights.keys())
     latest_prices: dict[str, float] = {}
-    for ticker in tickers:
-        inst = (
-            await session.execute(select(Instrument).where(Instrument.ticker == ticker.upper()))
+
+    # Batch fetch instruments + their latest price in 2 queries
+    insts = (
+        await session.execute(
+            select(Instrument).where(Instrument.ticker.in_([t.upper() for t in tickers]))
+        )
+    ).scalars().all()
+
+    for inst in insts:
+        row = (
+            await session.execute(
+                select(PriceCandle.close)
+                .where(PriceCandle.instrument_id == inst.id)
+                .order_by(PriceCandle.date.desc())
+                .limit(1)
+            )
         ).scalar_one_or_none()
-        if inst:
-            row = (
-                await session.execute(
-                    select(PriceCandle.close)
-                    .where(PriceCandle.instrument_id == inst.id)
-                    .order_by(PriceCandle.date.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if row:
-                latest_prices[ticker.upper()] = float(row)
+        if row:
+            latest_prices[inst.ticker] = float(row)
 
     orders = compute_rebalance_orders(
         current_positions=current_positions,
