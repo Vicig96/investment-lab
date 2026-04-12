@@ -7,6 +7,7 @@ const DEFAULT = {
   date_from: '2021-01-01',
   date_to: '2023-12-31',
   top_n: '3',
+  sweep_top_n: '1,2,3',
   initial_capital: '10000',
   commission_bps: '10',
   rebalance_frequency: 'monthly',
@@ -102,21 +103,36 @@ function calcCalmar(cagr, maxDrawdown) {
   return c / Math.abs(md)
 }
 
+function parseSweepTopN(raw) {
+  return raw
+    .split(',')
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n >= 1 && n <= 20)
+}
+
 function validate(form) {
   const tickers = parseTickerList(form.instrument_tickers)
   if (!tickers.length) return 'At least one ticker is required.'
   if (!form.date_from) return '"From" date is required.'
   if (!form.date_to) return '"To" date is required.'
   if (form.date_from >= form.date_to) return '"From" must be before "To".'
-  if (Number(form.top_n) <= 0) return 'Top N must be > 0.'
   if (Number(form.initial_capital) <= 0) return 'Initial capital must be > 0.'
   if (Number(form.commission_bps) < 0) return 'Commission must be >= 0.'
   if (Number(form.warmup_bars) < 0) return 'Warm-up bars must be >= 0.'
-  if (
-    (form.run_mode === 'compare_variants' || form.defensive_mode === 'defensive_asset')
-    && parseTickerList(form.defensive_tickers).length === 0
-  ) {
-    return 'Add at least one defensive ticker for defensive-asset comparisons.'
+  if (form.run_mode === 'parameter_sweep') {
+    const topNValues = parseSweepTopN(form.sweep_top_n)
+    if (!topNValues.length) return 'Enter at least one valid Top N value (1–20) for the sweep.'
+    if (parseTickerList(form.defensive_tickers).length === 0) {
+      return 'Add at least one defensive ticker — sweep runs both cash and defensive_asset modes.'
+    }
+  } else {
+    if (Number(form.top_n) <= 0) return 'Top N must be > 0.'
+    if (
+      (form.run_mode === 'compare_variants' || form.defensive_mode === 'defensive_asset')
+      && parseTickerList(form.defensive_tickers).length === 0
+    ) {
+      return 'Add at least one defensive ticker for defensive-asset comparisons.'
+    }
   }
   return null
 }
@@ -210,6 +226,7 @@ export default function ScreenerRotation() {
   const [formError, setFormError] = useState(null)
   const [singleResult, setSingleResult] = useState(null)
   const [comparisonResult, setComparisonResult] = useState(null)
+  const [sweepResult, setSweepResult] = useState(null)
 
   const setField = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }))
@@ -230,6 +247,7 @@ export default function ScreenerRotation() {
     setError(null)
     setSingleResult(null)
     setComparisonResult(null)
+    setSweepResult(null)
 
     try {
       const basePayload = buildBasePayload(form)
@@ -254,6 +272,38 @@ export default function ScreenerRotation() {
           defensiveVariant: defensiveVariant.value,
           benchmark: cashVariant.value.benchmark,
         })
+      } else if (form.run_mode === 'parameter_sweep') {
+        const topNValues = parseSweepTopN(form.sweep_top_n)
+        const defensiveModes = ['cash', 'defensive_asset']
+
+        // Build the full experiment grid: top_n × defensive_mode
+        const experiments = topNValues.flatMap((topN) =>
+          defensiveModes.map((defMode) => ({
+            label: `top_n=${topN} / ${defMode === 'cash' ? 'cash' : 'defensive'}`,
+            top_n: topN,
+            defensive_mode: defMode,
+            payload: { ...basePayload, top_n: topN, defensive_mode: defMode },
+          }))
+        )
+
+        const settled = await Promise.allSettled(
+          experiments.map((exp) => runScreenerRotation(exp.payload))
+        )
+
+        const rows = experiments.map((exp, i) => ({
+          ...exp,
+          status: settled[i].status,
+          result: settled[i].status === 'fulfilled' ? settled[i].value : null,
+          error: settled[i].status === 'rejected'
+            ? (settled[i].reason?.message ?? 'request failed')
+            : null,
+        }))
+
+        // Benchmark from first successful run
+        const firstOk = rows.find((r) => r.status === 'fulfilled')
+        const benchmark = firstOk?.result?.benchmark ?? null
+
+        setSweepResult({ rows, benchmark, totalRuns: experiments.length })
       } else {
         const data = await runScreenerRotation({
           ...basePayload,
@@ -379,6 +429,7 @@ export default function ScreenerRotation() {
               >
                 <option value="single">Single run</option>
                 <option value="compare_variants">Compare variants</option>
+                <option value="parameter_sweep">Parameter sweep</option>
               </select>
             </div>
           </div>
@@ -416,17 +467,31 @@ export default function ScreenerRotation() {
                 disabled={loading}
               />
             </div>
-            <div className="field" style={{ maxWidth: 120 }}>
-              <label>Top N</label>
-              <input
-                type="number"
-                min="1"
-                max="20"
-                value={form.top_n}
-                onChange={(event) => setField('top_n', event.target.value)}
-                disabled={loading}
-              />
-            </div>
+            {form.run_mode !== 'parameter_sweep' ? (
+              <div className="field" style={{ maxWidth: 120 }}>
+                <label>Top N</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  value={form.top_n}
+                  onChange={(event) => setField('top_n', event.target.value)}
+                  disabled={loading}
+                />
+              </div>
+            ) : (
+              <div className="field" style={{ maxWidth: 220 }}>
+                <label>Top N values (comma-separated)</label>
+                <input
+                  type="text"
+                  value={form.sweep_top_n}
+                  onChange={(event) => setField('sweep_top_n', event.target.value)}
+                  placeholder="1,2,3"
+                  spellCheck={false}
+                  disabled={loading}
+                />
+              </div>
+            )}
           </div>
 
           <div className="form-row">
@@ -479,8 +544,8 @@ export default function ScreenerRotation() {
               <select
                 value={form.defensive_mode}
                 onChange={(event) => setField('defensive_mode', event.target.value)}
-                disabled={loading || form.run_mode === 'compare_variants'}
-                style={form.run_mode === 'compare_variants' ? { opacity: 0.6 } : undefined}
+                disabled={loading || form.run_mode === 'compare_variants' || form.run_mode === 'parameter_sweep'}
+                style={(form.run_mode === 'compare_variants' || form.run_mode === 'parameter_sweep') ? { opacity: 0.6 } : undefined}
               >
                 <option value="cash">Stay in cash</option>
                 <option value="defensive_asset">Use defensive asset</option>
@@ -500,14 +565,17 @@ export default function ScreenerRotation() {
           </div>
 
           {form.run_mode === 'compare_variants' && (
-            <div
-              style={{
-                marginBottom: 12,
-                color: 'var(--muted)',
-                fontSize: 13,
-              }}
-            >
-              Compare mode runs both rotation variants automatically: `cash` and `defensive_asset`.
+            <div style={{ marginBottom: 12, color: 'var(--muted)', fontSize: 13 }}>
+              Compare mode runs both rotation variants automatically: cash and defensive_asset.
+            </div>
+          )}
+          {form.run_mode === 'parameter_sweep' && (
+            <div style={{ marginBottom: 12, color: 'var(--muted)', fontSize: 13 }}>
+              Sweep mode runs every combination of Top N × defensive mode automatically.
+              Each value in the Top N list is combined with both cash and defensive_asset.
+              {' '}<strong style={{ color: 'var(--text)' }}>
+                {parseSweepTopN(form.sweep_top_n).length * 2} experiment{parseSweepTopN(form.sweep_top_n).length * 2 !== 1 ? 's' : ''} will run.
+              </strong>
             </div>
           )}
 
@@ -516,7 +584,11 @@ export default function ScreenerRotation() {
           <div>
             <button className="btn btn-primary" type="submit" disabled={loading}>
               {loading ? <span className="spinner" /> : null}
-              {form.run_mode === 'compare_variants' ? 'Run Comparison' : 'Run Backtest'}
+              {form.run_mode === 'compare_variants'
+                ? 'Run Comparison'
+                : form.run_mode === 'parameter_sweep'
+                  ? 'Run Sweep'
+                  : 'Run Backtest'}
             </button>
           </div>
         </form>
@@ -524,9 +596,9 @@ export default function ScreenerRotation() {
         {error && <div className="alert alert-error" style={{ marginTop: 12 }}>{error}</div>}
       </div>
 
-      {!singleResult && !comparisonResult && !loading && !error && (
+      {!singleResult && !comparisonResult && !sweepResult && !loading && !error && (
         <div className="empty" style={{ paddingTop: 40 }}>
-          Configure the parameters above and run a single backtest or compare both variants.
+          Configure the parameters above and run a single backtest, compare both variants, or run a parameter sweep.
         </div>
       )}
 
@@ -534,7 +606,9 @@ export default function ScreenerRotation() {
         <div className="empty" style={{ paddingTop: 24 }}>
           {form.run_mode === 'compare_variants'
             ? 'Running both Screener Rotation variants. The comparison table will appear only after both finish successfully.'
-            : 'Running screener rotation backtest...'}
+            : form.run_mode === 'parameter_sweep'
+              ? `Running ${parseSweepTopN(form.sweep_top_n).length * 2} sweep experiments in parallel. Results will appear after all runs complete.`
+              : 'Running screener rotation backtest...'}
         </div>
       )}
 
@@ -687,6 +761,145 @@ export default function ScreenerRotation() {
           </div>
         </div>
       )}
+
+      {/* ── Parameter sweep results ────────────────────────────────────────── */}
+      {sweepResult && (() => {
+        const { rows, benchmark, totalRuns } = sweepResult
+        const failedRows  = rows.filter((r) => r.status === 'rejected')
+        const successRows = rows.filter((r) => r.status === 'fulfilled')
+
+        // Build rows in the shape isBestMetric expects: { metrics: {...} }
+        const tableRows = [
+          ...successRows.map((r) => ({
+            key:            r.label,
+            label:          r.label,
+            top_n:          r.top_n,
+            defensive_mode: r.defensive_mode,
+            isBenchmark:    false,
+            metrics:        r.result.metrics,
+          })),
+          ...(benchmark ? [{
+            key:            'benchmark',
+            label:          `${benchmark.ticker ?? 'SPY'} buy-and-hold`,
+            top_n:          null,
+            defensive_mode: null,
+            isBenchmark:    true,
+            metrics: {
+              final_equity: benchmark.final_equity,
+              cagr:         benchmark.cagr,
+              sharpe_ratio: benchmark.sharpe_ratio,
+              max_drawdown: benchmark.max_drawdown,
+              calmar_ratio: calcCalmar(benchmark.cagr, benchmark.max_drawdown),
+              total_trades: 0,
+            },
+          }] : []),
+        ]
+
+        // Only strategy rows (not benchmark) participate in best-value highlights
+        const strategyTableRows = tableRows.filter((r) => !r.isBenchmark)
+
+        return (
+          <div className="card">
+            <div className="card-title">
+              Parameter sweep — {totalRuns} experiments
+              &nbsp;·&nbsp;{form.date_from} → {form.date_to}
+            </div>
+
+            {/* Failure summary */}
+            {failedRows.length > 0 && (
+              <div className="alert alert-error" style={{ marginBottom: 12 }}>
+                <strong>{failedRows.length} experiment{failedRows.length !== 1 ? 's' : ''} failed:</strong>
+                <ul style={{ margin: '6px 0 0 0', paddingLeft: 18 }}>
+                  {failedRows.map((r) => (
+                    <li key={r.label} style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                      {r.label} — {r.error}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {successRows.length === 0 ? (
+              <div className="empty">All experiments failed. Check the errors above.</div>
+            ) : (
+              <>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Experiment</th>
+                        <th style={{ textAlign: 'right' }}>Top N</th>
+                        <th>Def. mode</th>
+                        <th style={{ textAlign: 'right' }}>Final equity</th>
+                        <th style={{ textAlign: 'right' }}>CAGR</th>
+                        <th style={{ textAlign: 'right' }}>Sharpe</th>
+                        <th style={{ textAlign: 'right' }}>Max DD</th>
+                        <th style={{ textAlign: 'right' }}>Calmar</th>
+                        <th style={{ textAlign: 'right' }}>Trades</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tableRows.map((row) => {
+                        const m   = row.metrics
+                        const ref = row.isBenchmark ? null : strategyTableRows
+                        const best = (key, pref, val) =>
+                          !row.isBenchmark && isBestMetric(ref, key, pref, val)
+                            ? BEST_CELL_STYLE : {}
+
+                        return (
+                          <tr
+                            key={row.key}
+                            style={row.isBenchmark
+                              ? { borderTop: '1px solid var(--border)', opacity: 0.75 }
+                              : undefined}
+                          >
+                            <td>
+                              <strong style={{ color: row.isBenchmark ? BENCHMARK_COLOR : 'var(--text)' }}>
+                                {row.label}
+                              </strong>
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--muted)' }}>
+                              {row.top_n ?? '—'}
+                            </td>
+                            <td style={{ color: 'var(--muted)', fontSize: 12 }}>
+                              {row.defensive_mode === 'cash'
+                                ? 'cash'
+                                : row.defensive_mode === 'defensive_asset'
+                                  ? 'defensive'
+                                  : '—'}
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', ...best('final_equity', 'higher', m.final_equity) }}>
+                              ${fmt(m.final_equity)}
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(m.cagr), ...best('cagr', 'higher', m.cagr) }}>
+                              {pct(m.cagr)}
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(m.sharpe_ratio), ...best('sharpe_ratio', 'higher', m.sharpe_ratio) }}>
+                              {fmt(m.sharpe_ratio)}
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--error)', ...best('max_drawdown', 'lower', m.max_drawdown) }}>
+                              {absPct(m.max_drawdown)}
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', ...best('calmar_ratio', 'higher', m.calmar_ratio) }}>
+                              {fmt(m.calmar_ratio)}
+                            </td>
+                            <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--muted)' }}>
+                              {m.total_trades ?? '—'}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div style={{ marginTop: 10, fontSize: 12, color: 'var(--muted)' }}>
+                  Highlighted cells mark the best strategy value per column. Benchmark row is shown for reference only and does not compete for highlights.
+                </div>
+              </>
+            )}
+          </div>
+        )
+      })()}
 
       {result && (
         <>
