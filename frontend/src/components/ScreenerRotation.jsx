@@ -1871,6 +1871,75 @@ export default function ScreenerRotation() {
             return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
           })[0] ?? null
 
+        const configProfiles = ranked.map((row) => {
+          const metricsByPreset = PRESET_WINDOWS
+            .map((preset) => resultsByConfig.get(row.configKey)?.get(preset.label) ?? null)
+            .filter(Boolean)
+          const fullCycleMetrics = resultsByConfig.get(row.configKey)?.get('Full cycle') ?? null
+          const stats = robustnessByConfig.get(row.configKey)
+
+          return {
+            configKey: row.configKey,
+            avgCagr: average(
+              metricsByPreset
+                .map((metrics) => numericValue(metrics.cagr))
+                .filter((value) => value != null),
+            ),
+            avgFinalEquity: average(
+              metricsByPreset
+                .map((metrics) => numericValue(metrics.final_equity))
+                .filter((value) => value != null),
+            ),
+            avgAbsDrawdown: average(
+              metricsByPreset
+                .map((metrics) => numericValue(metrics.max_drawdown))
+                .filter((value) => value != null)
+                .map((value) => Math.abs(value)),
+            ),
+            fullCycleAvgRank: scores.get(row.configKey)?.presetAvg?.get('Full cycle') ?? null,
+            fullCycleCagr: numericValue(fullCycleMetrics?.cagr),
+            avgRank: row.score != null && row.score < 999 ? row.score : null,
+            rankStdDev: stats?.rankStdDev ?? null,
+            timesRank1: stats?.timesRank1 ?? 0,
+            timesTop2: stats?.timesTop2 ?? 0,
+            robustnessScore: stats?.robustnessScore ?? null,
+          }
+        })
+
+        const bestReturnConfig = configProfiles
+          .filter((profile) => profile.avgCagr != null)
+          .sort((a, b) => {
+            if (b.avgCagr !== a.avgCagr) return b.avgCagr - a.avgCagr
+            if ((b.avgFinalEquity ?? -Infinity) !== (a.avgFinalEquity ?? -Infinity)) {
+              return (b.avgFinalEquity ?? -Infinity) - (a.avgFinalEquity ?? -Infinity)
+            }
+            return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
+          })[0] ?? null
+
+        const bestDrawdownControl = configProfiles
+          .filter((profile) => profile.avgAbsDrawdown != null)
+          .sort((a, b) => {
+            if (a.avgAbsDrawdown !== b.avgAbsDrawdown) return a.avgAbsDrawdown - b.avgAbsDrawdown
+            if ((a.rankStdDev ?? Infinity) !== (b.rankStdDev ?? Infinity)) {
+              return (a.rankStdDev ?? Infinity) - (b.rankStdDev ?? Infinity)
+            }
+            return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
+          })[0] ?? null
+
+        const recommendedDefault = configProfiles
+          .filter((profile) => profile.robustnessScore != null)
+          .sort((a, b) => {
+            if (a.robustnessScore !== b.robustnessScore) return a.robustnessScore - b.robustnessScore
+            if ((a.fullCycleAvgRank ?? Infinity) !== (b.fullCycleAvgRank ?? Infinity)) {
+              return (a.fullCycleAvgRank ?? Infinity) - (b.fullCycleAvgRank ?? Infinity)
+            }
+            if ((a.avgAbsDrawdown ?? Infinity) !== (b.avgAbsDrawdown ?? Infinity)) {
+              return (a.avgAbsDrawdown ?? Infinity) - (b.avgAbsDrawdown ?? Infinity)
+            }
+            if ((b.timesRank1 ?? 0) !== (a.timesRank1 ?? 0)) return (b.timesRank1 ?? 0) - (a.timesRank1 ?? 0)
+            return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
+          })[0] ?? null
+
         const rankingPreview = buildPreviewState(ranked, getSectionMode('cross_preset_ranking'))
         const presetDetailCards = PRESET_WINDOWS
           .map((preset) => {
@@ -1950,6 +2019,12 @@ export default function ScreenerRotation() {
           background: 'rgba(34, 197, 94, 0.12)',
           color: 'var(--success)',
           border: '1px solid rgba(34, 197, 94, 0.3)',
+        }
+        const RECOMMEND_STYLE = {
+          ...WINNER_STYLE,
+          background: 'rgba(79, 142, 247, 0.12)',
+          color: 'var(--accent)',
+          border: '1px solid rgba(79, 142, 247, 0.3)',
         }
         return (
           <>
@@ -2161,6 +2236,67 @@ export default function ScreenerRotation() {
                     />
                   </div>
                 )}
+                <div className="card">
+                  <div className="card-title">Recommended configuration</div>
+
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+                    gap: 12,
+                    marginBottom: 16,
+                  }}>
+                    <div className="metric-box">
+                      <div className="metric-label">Best return config</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestReturnConfig?.configKey ?? '-'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        highest average CAGR: {pct(bestReturnConfig?.avgCagr)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Most robust config</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{mostRobust?.configKey ?? '-'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        lowest avg rank + std dev: {fmt(mostRobust?.robustnessScore)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Best bear-market config</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestByPreset.get('Rate hike bear') ?? '-'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        best preset rank in Rate hike bear
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Best drawdown-control config</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{bestDrawdownControl?.configKey ?? '-'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        lowest average |max drawdown|: {absPct(bestDrawdownControl?.avgAbsDrawdown)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Recommended default config</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={RECOMMEND_STYLE}>{recommendedDefault?.configKey ?? '-'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        robustness first, then Full cycle rank, then drawdown control, then tie-breaks
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+                    Recommendation logic is explicit in code: best return = highest average CAGR across preset windows; most robust = lowest average-rank-plus-std-dev score; drawdown control = lowest average absolute max drawdown; recommended default = robustness first, then Full cycle average rank, then lower average drawdown, then more #1 finishes, then lower overall average rank.
+                  </div>
+                </div>
+
                 {presetDetailPreview.items.map((detail, detailIndex) => {
                   if (detail?.__preview_gap) {
                     return (
