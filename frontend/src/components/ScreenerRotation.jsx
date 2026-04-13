@@ -585,6 +585,118 @@ function PreviewGapRow({ colSpan, hiddenCount }) {
   )
 }
 
+function average(values) {
+  if (!Array.isArray(values) || values.length === 0) return null
+  return values.reduce((sum, value) => sum + value, 0) / values.length
+}
+
+function stdDeviation(values) {
+  if (!Array.isArray(values) || values.length === 0) return null
+  const avg = average(values)
+  if (avg == null) return null
+  const variance = values.reduce((sum, value) => sum + (value - avg) ** 2, 0) / values.length
+  return Math.sqrt(variance)
+}
+
+function visiblePreviewItems(preview) {
+  if (!Array.isArray(preview?.items)) return []
+  return preview.items.filter((item) => item && !item.__preview_gap)
+}
+
+function slugifyFilePart(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    || 'na'
+}
+
+function toCsvCell(value) {
+  if (value == null) return ''
+  const stringValue = String(value)
+  if (/[",\r\n]/.test(stringValue)) {
+    return `"${stringValue.replace(/"/g, '""')}"`
+  }
+  return stringValue
+}
+
+function buildCsvContent(metadata, columns, rows) {
+  const lines = [
+    ['meta_key', 'meta_value'],
+    ...metadata.map((entry) => [entry.key, entry.value]),
+    [],
+    columns.map((column) => column.label),
+    ...rows.map((row) => columns.map((column) => column.value(row))),
+  ]
+
+  return lines
+    .map((line) => (line.length > 0 ? line.map(toCsvCell).join(',') : ''))
+    .join('\r\n')
+}
+
+function triggerCsvDownload(filename, content) {
+  if (typeof document === 'undefined') return
+  const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+function buildExportFilename(form, mode, suffix = 'results') {
+  const tickers = parseTickerList(form.instrument_tickers).slice(0, 5).join('-') || 'universe'
+  const windowLabel = mode === 'walk-forward'
+    ? `${form.wf_data_start}-to-${form.wf_data_end}`
+    : mode === 'cross-preset'
+      ? 'preset-windows'
+      : `${form.date_from}-to-${form.date_to}`
+  const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  return [
+    'screener-rotation',
+    slugifyFilePart(mode),
+    slugifyFilePart(tickers),
+    slugifyFilePart(windowLabel),
+    slugifyFilePart(suffix),
+    timestamp,
+  ].join('-') + '.csv'
+}
+
+function buildBaseExportMetadata(form, mode) {
+  return [
+    { key: 'run_mode', value: mode },
+    { key: 'tickers', value: parseTickerList(form.instrument_tickers).join('|') },
+    { key: 'initial_capital', value: form.initial_capital },
+    { key: 'commission_bps', value: form.commission_bps },
+    { key: 'rebalance_frequency', value: form.rebalance_frequency },
+    { key: 'warmup_bars', value: form.warmup_bars },
+    { key: 'defensive_tickers', value: parseTickerList(form.defensive_tickers).join('|') },
+  ]
+}
+
+function exportVisibleCsv({ form, mode, suffix, metadata, columns, rows }) {
+  const csv = buildCsvContent(metadata, columns, rows)
+  const filename = buildExportFilename(form, mode, suffix)
+  triggerCsvDownload(filename, csv)
+}
+
+function ExportButton({ onClick, disabled = false }) {
+  return (
+    <button
+      type="button"
+      className="btn btn-secondary btn-compact"
+      onClick={onClick}
+      disabled={disabled}
+    >
+      Export CSV
+    </button>
+  )
+}
+
 export default function ScreenerRotation() {
   const [form, setForm] = useState(DEFAULT)
   const [loading, setLoading] = useState(false)
@@ -1511,12 +1623,54 @@ export default function ScreenerRotation() {
 
         // Only strategy rows (not benchmark) participate in best-value highlights
         const strategyTableRows = tableRows.filter((r) => !r.isBenchmark)
+        const exportSweepRows = tableRows.map((row) => ({
+          experiment: row.label,
+          row_type: row.isBenchmark ? 'benchmark' : 'strategy',
+          top_n: row.top_n ?? '',
+          defensive_mode: row.defensive_mode ?? '',
+          final_equity: row.metrics.final_equity,
+          cagr: row.metrics.cagr,
+          sharpe_ratio: row.metrics.sharpe_ratio,
+          max_drawdown: row.metrics.max_drawdown,
+          calmar_ratio: row.metrics.calmar_ratio,
+          total_trades: row.metrics.total_trades ?? '',
+        }))
+        const exportSweepCsv = () => exportVisibleCsv({
+          form,
+          mode: 'parameter-sweep',
+          suffix: 'visible-results',
+          metadata: [
+            ...buildBaseExportMetadata(form, 'parameter_sweep'),
+            { key: 'date_from', value: form.date_from },
+            { key: 'date_to', value: form.date_to },
+            { key: 'top_n_values', value: parseSweepTopN(form.sweep_top_n).join('|') },
+            { key: 'defensive_modes', value: 'cash|defensive_asset' },
+            { key: 'ranking_mode', value: 'none' },
+            { key: 'visible_rows_exported', value: exportSweepRows.length },
+          ],
+          columns: [
+            { label: 'experiment', value: (row) => row.experiment },
+            { label: 'row_type', value: (row) => row.row_type },
+            { label: 'top_n', value: (row) => row.top_n },
+            { label: 'defensive_mode', value: (row) => row.defensive_mode },
+            { label: 'final_equity', value: (row) => row.final_equity },
+            { label: 'cagr', value: (row) => row.cagr },
+            { label: 'sharpe_ratio', value: (row) => row.sharpe_ratio },
+            { label: 'max_drawdown', value: (row) => row.max_drawdown },
+            { label: 'calmar_ratio', value: (row) => row.calmar_ratio },
+            { label: 'total_trades', value: (row) => row.total_trades },
+          ],
+          rows: exportSweepRows,
+        })
 
         return (
           <div className="card">
-            <div className="card-title">
-              Parameter sweep — {totalRuns} experiments
-              &nbsp;·&nbsp;{form.date_from} → {form.date_to}
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
+              <div className="card-title" style={{ marginBottom: 0 }}>
+                Parameter sweep — {totalRuns} experiments
+                &nbsp;·&nbsp;{form.date_from} → {form.date_to}
+              </div>
+              {successRows.length > 0 && <ExportButton onClick={exportSweepCsv} />}
             </div>
 
             {/* Failure summary */}
@@ -1653,33 +1807,69 @@ export default function ScreenerRotation() {
           if (best) bestByPreset.set(pLabel, best)
         }
 
-        // Best risk-adjusted: best average sharpe rank across presets
-        let bestRiskAdj = null
-        let bestRiskVal = 999
-        for (const ck of configKeys) {
-          const sharpes = PRESET_WINDOWS.map((p) => {
-            const m = resultsByConfig.get(ck)?.get(p.label)
-            return m ? numericValue(m.sharpe_ratio) : null
-          }).filter((v) => v != null)
-          if (sharpes.length > 0) {
-            const avg = sharpes.reduce((a, b) => a + b, 0) / sharpes.length
-            if (avg > bestRiskVal || bestRiskAdj === null) { bestRiskVal = avg; bestRiskAdj = ck }
+        const presetPlacementRanks = new Map(configKeys.map((ck) => [ck, new Map()]))
+        for (const preset of PRESET_WINDOWS) {
+          const presetValues = configKeys.map((ck) => scores.get(ck)?.presetAvg?.get(preset.label) ?? null)
+          const presetRanks = denseRank(presetValues, false)
+          for (let i = 0; i < configKeys.length; i++) {
+            if (presetRanks[i] != null) {
+              presetPlacementRanks.get(configKeys[i]).set(preset.label, presetRanks[i])
+            }
           }
         }
 
-        // Best drawdown control: lowest average |max_drawdown| across presets
-        let bestDD = null
-        let bestDDVal = 999
-        for (const ck of configKeys) {
-          const dds = PRESET_WINDOWS.map((p) => {
-            const m = resultsByConfig.get(ck)?.get(p.label)
-            return m ? numericValue(m.max_drawdown) : null
-          }).filter((v) => v != null).map((v) => Math.abs(v))
-          if (dds.length > 0) {
-            const avg = dds.reduce((a, b) => a + b, 0) / dds.length
-            if (avg < bestDDVal) { bestDDVal = avg; bestDD = ck }
+        const robustnessRows = ranked.map((row) => {
+          const presetAverages = PRESET_WINDOWS
+            .map((preset) => scores.get(row.configKey)?.presetAvg?.get(preset.label))
+            .filter((value) => value != null)
+          const placementRanks = PRESET_WINDOWS
+            .map((preset) => presetPlacementRanks.get(row.configKey)?.get(preset.label))
+            .filter((value) => value != null)
+          const avgRank = row.score != null && row.score < 999 ? row.score : null
+          const rankStdDev = stdDeviation(presetAverages)
+          const timesRank1 = placementRanks.filter((rank) => rank === 1).length
+          const timesTop2 = placementRanks.filter((rank) => rank <= 2).length
+          const robustnessScore = avgRank != null && rankStdDev != null ? avgRank + rankStdDev : avgRank
+          return {
+            ...row,
+            avgRank,
+            rankStdDev,
+            timesRank1,
+            timesTop2,
+            robustnessScore,
           }
-        }
+        })
+
+        const rankStdValues = robustnessRows.map((row) => row.rankStdDev).filter((value) => value != null)
+        const top1Values = robustnessRows.map((row) => row.timesRank1).filter((value) => value != null)
+        const top2Values = robustnessRows.map((row) => row.timesTop2).filter((value) => value != null)
+        const bestRankStdDev = rankStdValues.length > 0 ? Math.min(...rankStdValues) : null
+        const bestTop1Count = top1Values.length > 0 ? Math.max(...top1Values) : null
+        const bestTop2Count = top2Values.length > 0 ? Math.max(...top2Values) : null
+        const robustnessByConfig = new Map(robustnessRows.map((row) => [row.configKey, row]))
+
+        const mostRobust = robustnessRows
+          .filter((row) => row.robustnessScore != null)
+          .sort((a, b) => {
+            if (a.robustnessScore !== b.robustnessScore) return a.robustnessScore - b.robustnessScore
+            if ((a.rankStdDev ?? Infinity) !== (b.rankStdDev ?? Infinity)) return (a.rankStdDev ?? Infinity) - (b.rankStdDev ?? Infinity)
+            if ((a.avgRank ?? Infinity) !== (b.avgRank ?? Infinity)) return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
+            return (b.timesRank1 ?? 0) - (a.timesRank1 ?? 0)
+          })[0] ?? null
+
+        const top1Leader = robustnessRows
+          .slice()
+          .sort((a, b) => {
+            if ((b.timesRank1 ?? 0) !== (a.timesRank1 ?? 0)) return (b.timesRank1 ?? 0) - (a.timesRank1 ?? 0)
+            return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
+          })[0] ?? null
+
+        const top2Leader = robustnessRows
+          .slice()
+          .sort((a, b) => {
+            if ((b.timesTop2 ?? 0) !== (a.timesTop2 ?? 0)) return (b.timesTop2 ?? 0) - (a.timesTop2 ?? 0)
+            return (a.avgRank ?? Infinity) - (b.avgRank ?? Infinity)
+          })[0] ?? null
 
         const rankingPreview = buildPreviewState(ranked, getSectionMode('cross_preset_ranking'))
         const presetDetailCards = PRESET_WINDOWS
@@ -1706,6 +1896,50 @@ export default function ScreenerRotation() {
           getSectionMode('cross_preset_details'),
           { previewHead: 1, previewTail: 0, moreHead: 2, moreTail: 0 },
         )
+        const visibleRankingRows = visiblePreviewItems(rankingPreview).map((row, index) => {
+          const stats = robustnessByConfig.get(row.configKey)
+          return {
+            rank: ranked.findIndex((entry) => entry.configKey === row.configKey) + 1 || index + 1,
+            config_key: row.configKey,
+            bull_run_avg_rank: scores.get(row.configKey)?.presetAvg?.get('Bull run') ?? '',
+            rate_hike_bear_avg_rank: scores.get(row.configKey)?.presetAvg?.get('Rate hike bear') ?? '',
+            mixed_volatile_avg_rank: scores.get(row.configKey)?.presetAvg?.get('Mixed / volatile') ?? '',
+            full_cycle_avg_rank: scores.get(row.configKey)?.presetAvg?.get('Full cycle') ?? '',
+            average_rank: stats?.avgRank ?? '',
+            rank_std_dev: stats?.rankStdDev ?? '',
+            times_ranked_1: stats?.timesRank1 ?? '',
+            times_ranked_top_2: stats?.timesTop2 ?? '',
+            robustness_score: stats?.robustnessScore ?? '',
+          }
+        })
+        const exportCrossPresetCsv = () => exportVisibleCsv({
+          form,
+          mode: 'cross-preset',
+          suffix: 'visible-ranking',
+          metadata: [
+            ...buildBaseExportMetadata(form, 'cross_preset'),
+            { key: 'preset_windows', value: PRESET_WINDOWS.map((preset) => `${preset.label}:${preset.date_from}->${preset.date_to}`).join('|') },
+            { key: 'top_n_values', value: parseSweepTopN(form.sweep_top_n).join('|') },
+            { key: 'defensive_modes', value: 'cash|defensive_asset' },
+            { key: 'ranking_mode', value: 'lower average preset rank across cagr|sharpe|max_drawdown|calmar' },
+            { key: 'visible_rows_exported', value: visibleRankingRows.length },
+            { key: 'hidden_rows_omitted', value: rankingPreview.hiddenCount },
+          ],
+          columns: [
+            { label: 'rank', value: (row) => row.rank },
+            { label: 'config_key', value: (row) => row.config_key },
+            { label: 'bull_run_avg_rank', value: (row) => row.bull_run_avg_rank },
+            { label: 'rate_hike_bear_avg_rank', value: (row) => row.rate_hike_bear_avg_rank },
+            { label: 'mixed_volatile_avg_rank', value: (row) => row.mixed_volatile_avg_rank },
+            { label: 'full_cycle_avg_rank', value: (row) => row.full_cycle_avg_rank },
+            { label: 'average_rank', value: (row) => row.average_rank },
+            { label: 'rank_std_dev', value: (row) => row.rank_std_dev },
+            { label: 'times_ranked_1', value: (row) => row.times_ranked_1 },
+            { label: 'times_ranked_top_2', value: (row) => row.times_ranked_top_2 },
+            { label: 'robustness_score', value: (row) => row.robustness_score },
+          ],
+          rows: visibleRankingRows,
+        })
 
         const WINNER_STYLE = {
           display: 'inline-block',
@@ -1717,7 +1951,6 @@ export default function ScreenerRotation() {
           color: 'var(--success)',
           border: '1px solid rgba(34, 197, 94, 0.3)',
         }
-
         return (
           <>
             {/* Failures */}
@@ -1762,6 +1995,15 @@ export default function ScreenerRotation() {
                       </div>
                     </div>
                     <div className="metric-box">
+                      <div className="metric-label">Most robust config</div>
+                      <div className="metric-value" style={{ fontSize: 16 }}>
+                        <span style={WINNER_STYLE}>{mostRobust?.configKey ?? '-'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        score {fmt(mostRobust?.robustnessScore)} = avg {fmt(mostRobust?.avgRank)} + std {fmt(mostRobust?.rankStdDev)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
                       <div className="metric-label">Best in bull market</div>
                       <div className="metric-value" style={{ fontSize: 16 }}>
                         <span style={WINNER_STYLE}>{bestByPreset.get('Bull run') ?? '—'}</span>
@@ -1774,21 +2016,21 @@ export default function ScreenerRotation() {
                       </div>
                     </div>
                     <div className="metric-box">
-                      <div className="metric-label">Best risk-adjusted</div>
+                      <div className="metric-label">Most #1 finishes</div>
                       <div className="metric-value" style={{ fontSize: 16 }}>
-                        <span style={WINNER_STYLE}>{bestRiskAdj ?? '—'}</span>
+                        <span style={WINNER_STYLE}>{top1Leader?.configKey ?? '-'}</span>
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-                        avg Sharpe {bestRiskVal !== 999 ? bestRiskVal.toFixed(2) : '—'}
+                        {top1Leader?.timesRank1 ?? 0} preset win{top1Leader?.timesRank1 === 1 ? '' : 's'}
                       </div>
                     </div>
                     <div className="metric-box">
-                      <div className="metric-label">Best drawdown control</div>
+                      <div className="metric-label">Most top-2 finishes</div>
                       <div className="metric-value" style={{ fontSize: 16 }}>
-                        <span style={WINNER_STYLE}>{bestDD ?? '—'}</span>
+                        <span style={WINNER_STYLE}>{top2Leader?.configKey ?? '-'}</span>
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-                        avg |DD| {bestDDVal !== 999 ? absPct(bestDDVal) : '—'}
+                        {top2Leader?.timesTop2 ?? 0} top-2 finish{top2Leader?.timesTop2 === 1 ? '' : 'es'}
                       </div>
                     </div>
                   </div>
@@ -1796,6 +2038,9 @@ export default function ScreenerRotation() {
                   {/* ── Overall ranking table (sorted by average rank) ── */}
                   <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
                     Overall ranking — lower average rank is better
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+                    <ExportButton onClick={exportCrossPresetCsv} disabled={visibleRankingRows.length === 0} />
                   </div>
                   <PreviewControls
                     preview={rankingPreview}
@@ -1814,6 +2059,9 @@ export default function ScreenerRotation() {
                             </th>
                           ))}
                           <th style={{ textAlign: 'right' }}>Avg rank</th>
+                          <th style={{ textAlign: 'right' }}>Std dev</th>
+                          <th style={{ textAlign: 'right' }}>#1</th>
+                          <th style={{ textAlign: 'right' }}>Top 2</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1822,7 +2070,7 @@ export default function ScreenerRotation() {
                             return (
                               <PreviewGapRow
                                 key={`cross-preset-gap-${row.hiddenCount}-${i}`}
-                                colSpan={PRESET_WINDOWS.length + 3}
+                                colSpan={PRESET_WINDOWS.length + 6}
                                 hiddenCount={row.hiddenCount}
                               />
                             )
@@ -1830,6 +2078,7 @@ export default function ScreenerRotation() {
 
                           const absoluteIndex = ranked.findIndex((entry) => entry.configKey === row.configKey)
                           const s = scores.get(row.configKey)
+                          const stats = robustnessByConfig.get(row.configKey)
                           const isWinner = absoluteIndex === 0
                           return (
                             <tr
@@ -1868,6 +2117,27 @@ export default function ScreenerRotation() {
                               }}>
                                 {row.score != null && row.score < 999 ? row.score.toFixed(2) : '—'}
                               </td>
+                              <td style={{
+                                textAlign: 'right',
+                                fontFamily: 'monospace',
+                                ...(stats?.rankStdDev != null && bestRankStdDev != null && Math.abs(stats.rankStdDev - bestRankStdDev) < 1e-9 ? BEST_CELL_STYLE : {}),
+                              }}>
+                                {stats?.rankStdDev != null ? stats.rankStdDev.toFixed(2) : '—'}
+                              </td>
+                              <td style={{
+                                textAlign: 'right',
+                                fontFamily: 'monospace',
+                                ...(stats?.timesRank1 != null && bestTop1Count != null && stats.timesRank1 === bestTop1Count ? BEST_CELL_STYLE : {}),
+                              }}>
+                                {stats?.timesRank1 ?? '—'}
+                              </td>
+                              <td style={{
+                                textAlign: 'right',
+                                fontFamily: 'monospace',
+                                ...(stats?.timesTop2 != null && bestTop2Count != null && stats.timesTop2 === bestTop2Count ? BEST_CELL_STYLE : {}),
+                              }}>
+                                {stats?.timesTop2 ?? '—'}
+                              </td>
                             </tr>
                           )
                         })}
@@ -1876,7 +2146,7 @@ export default function ScreenerRotation() {
                   </div>
                   <div style={{ marginTop: 8, fontSize: 12, color: 'var(--muted)' }}>
                     Each cell shows the average metric rank (across CAGR, Sharpe, Max DD, Calmar) within that preset window. Lower is better.
-                    Green highlights mark the best configuration per regime.
+                    Green highlights mark the best configuration per regime, the lowest rank variability, and the strongest #1 / top-2 consistency.
                   </div>
                 </div>
 
@@ -2020,6 +2290,65 @@ export default function ScreenerRotation() {
           color: 'var(--success)',
           border: '1px solid rgba(34, 197, 94, 0.3)',
         }
+        const visibleFoldRows = visiblePreviewItems(foldsPreview).map((fold) => ({
+          fold: fold.fold,
+          train_from: fold.trainFrom,
+          train_to: fold.trainTo,
+          test_from: fold.testFrom,
+          test_to: fold.testTo,
+          train_winner: fold.trainWinner ?? '',
+          train_avg_rank: fold.trainAvgRank ?? '',
+          oos_final_equity: fold.testMetrics?.final_equity ?? '',
+          oos_cagr: fold.testMetrics?.cagr ?? '',
+          oos_sharpe_ratio: fold.testMetrics?.sharpe_ratio ?? '',
+          oos_max_drawdown: fold.testMetrics?.max_drawdown ?? '',
+          oos_calmar_ratio: fold.testMetrics?.calmar_ratio ?? '',
+          benchmark_ticker: 'SPY',
+          benchmark_final_equity: fold.benchmarkMetrics?.final_equity ?? '',
+          benchmark_cagr: fold.benchmarkMetrics?.cagr ?? '',
+          benchmark_sharpe_ratio: fold.benchmarkMetrics?.sharpe_ratio ?? '',
+          benchmark_max_drawdown: fold.benchmarkMetrics?.max_drawdown ?? '',
+          error: fold.error ?? '',
+        }))
+        const exportWalkForwardCsv = () => exportVisibleCsv({
+          form,
+          mode: 'walk-forward',
+          suffix: 'visible-folds',
+          metadata: [
+            ...buildBaseExportMetadata(form, 'walk_forward'),
+            { key: 'data_start', value: form.wf_data_start },
+            { key: 'data_end', value: form.wf_data_end },
+            { key: 'train_years', value: form.wf_train_years },
+            { key: 'test_years', value: form.wf_test_years },
+            { key: 'step_years', value: form.wf_step_years },
+            { key: 'top_n_values', value: parseSweepTopN(form.sweep_top_n).join('|') },
+            { key: 'defensive_modes', value: 'cash|defensive_asset' },
+            { key: 'ranking_mode', value: 'winner chosen on training-window avg rank across cagr|sharpe|max_drawdown|calmar' },
+            { key: 'visible_rows_exported', value: visibleFoldRows.length },
+            { key: 'hidden_rows_omitted', value: foldsPreview.hiddenCount },
+          ],
+          columns: [
+            { label: 'fold', value: (row) => row.fold },
+            { label: 'train_from', value: (row) => row.train_from },
+            { label: 'train_to', value: (row) => row.train_to },
+            { label: 'test_from', value: (row) => row.test_from },
+            { label: 'test_to', value: (row) => row.test_to },
+            { label: 'train_winner', value: (row) => row.train_winner },
+            { label: 'train_avg_rank', value: (row) => row.train_avg_rank },
+            { label: 'oos_final_equity', value: (row) => row.oos_final_equity },
+            { label: 'oos_cagr', value: (row) => row.oos_cagr },
+            { label: 'oos_sharpe_ratio', value: (row) => row.oos_sharpe_ratio },
+            { label: 'oos_max_drawdown', value: (row) => row.oos_max_drawdown },
+            { label: 'oos_calmar_ratio', value: (row) => row.oos_calmar_ratio },
+            { label: 'benchmark_ticker', value: (row) => row.benchmark_ticker },
+            { label: 'benchmark_final_equity', value: (row) => row.benchmark_final_equity },
+            { label: 'benchmark_cagr', value: (row) => row.benchmark_cagr },
+            { label: 'benchmark_sharpe_ratio', value: (row) => row.benchmark_sharpe_ratio },
+            { label: 'benchmark_max_drawdown', value: (row) => row.benchmark_max_drawdown },
+            { label: 'error', value: (row) => row.error },
+          ],
+          rows: visibleFoldRows,
+        })
 
         return (
           <>
@@ -2099,6 +2428,9 @@ export default function ScreenerRotation() {
                   {/* ── Fold-by-fold table ── */}
                   <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
                     Fold details — train winner → out-of-sample performance
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+                    <ExportButton onClick={exportWalkForwardCsv} disabled={visibleFoldRows.length === 0} />
                   </div>
                   <PreviewControls
                     preview={foldsPreview}
