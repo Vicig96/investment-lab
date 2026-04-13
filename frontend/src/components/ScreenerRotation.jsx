@@ -1087,16 +1087,6 @@ export default function ScreenerRotation() {
             <div className="field">
               <label>Preset windows</label>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {presetDetailCards.length > 0 && (
-                  <div className="card">
-                    <div className="card-title">Per-preset detail tables</div>
-                    <PreviewControls
-                      preview={presetDetailPreview}
-                      itemLabel="preset tables"
-                      onModeChange={(mode) => setSectionMode('cross_preset_details', mode)}
-                    />
-                  </div>
-                )}
                 {PRESET_WINDOWS.map((preset) => {
                   const active =
                     form.date_from === preset.date_from &&
