@@ -27,18 +27,11 @@ export default function ScreenerRotation() {
   const [sweepResult, setSweepResult] = useState(null)
   const [crossPresetResult, setCrossPresetResult] = useState(null)
   const [walkForwardResult, setWalkForwardResult] = useState(null)
-  const [sectionModes, setSectionModes] = useState({})
 
   const setField = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }))
     setFormError(null)
   }
-
-  const setSectionMode = (key, mode) => {
-    setSectionModes((prev) => ({ ...prev, [key]: mode }))
-  }
-
-  const getSectionMode = (key) => sectionModes[key] ?? 'preview'
 
   const submit = async (event) => {
     event.preventDefault()
@@ -57,7 +50,6 @@ export default function ScreenerRotation() {
     setSweepResult(null)
     setCrossPresetResult(null)
     setWalkForwardResult(null)
-    setSectionModes({})
 
     try {
       const basePayload = buildBasePayload(form)
@@ -306,23 +298,9 @@ export default function ScreenerRotation() {
 
       <CompareResults comparisonResult={comparisonResult} form={form} />
       <ParameterSweepResults sweepResult={sweepResult} form={form} />
-      <CrossPresetResults
-        crossPresetResult={crossPresetResult}
-        form={form}
-        getSectionMode={getSectionMode}
-        setSectionMode={setSectionMode}
-      />
-      <WalkForwardResults
-        walkForwardResult={walkForwardResult}
-        form={form}
-        getSectionMode={getSectionMode}
-        setSectionMode={setSectionMode}
-      />
-      <SingleRunResults
-        result={singleResult}
-        getSectionMode={getSectionMode}
-        setSectionMode={setSectionMode}
-      />
+      <CrossPresetResults crossPresetResult={crossPresetResult} />
+      <WalkForwardResults walkForwardResult={walkForwardResult} />
+      <SingleRunResults result={singleResult} />
     </>
   )
 }

@@ -55,6 +55,17 @@ export const BEST_CELL_STYLE = {
   fontWeight: 700,
 }
 
+export const WINNER_STYLE = {
+  display: 'inline-block',
+  padding: '3px 10px',
+  borderRadius: 4,
+  fontSize: 12,
+  fontWeight: 700,
+  background: 'rgba(34, 197, 94, 0.12)',
+  color: 'var(--success)',
+  border: '1px solid rgba(34, 197, 94, 0.3)',
+}
+
 export function fmt(value, decimals = 2) {
   if (value == null || value === '') return '-'
   const num = Number(value)
@@ -150,7 +161,7 @@ export function validate(form) {
     const topNValues = parseSweepTopN(form.sweep_top_n)
     if (!topNValues.length) return 'Enter at least one valid Top N value (1-20).'
     if (parseTickerList(form.defensive_tickers).length === 0) {
-      return 'Add at least one defensive ticker - cross-preset runs both cash and defensive_asset.'
+      return 'Add at least one defensive ticker \u2013 cross-preset runs both cash and defensive_asset.'
     }
     return null
   }
@@ -162,7 +173,7 @@ export function validate(form) {
     const topNValues = parseSweepTopN(form.sweep_top_n)
     if (!topNValues.length) return 'Enter at least one valid Top N value (1-20).'
     if (parseTickerList(form.defensive_tickers).length === 0) {
-      return 'Add at least one defensive ticker - walk-forward runs both cash and defensive_asset.'
+      return 'Add at least one defensive ticker \u2013 walk-forward runs both cash and defensive_asset.'
     }
     const trainYears = parseInt(form.wf_train_years, 10)
     const testYears = parseInt(form.wf_test_years, 10)
@@ -185,7 +196,7 @@ export function validate(form) {
     const topNValues = parseSweepTopN(form.sweep_top_n)
     if (!topNValues.length) return 'Enter at least one valid Top N value (1-20) for the sweep.'
     if (parseTickerList(form.defensive_tickers).length === 0) {
-      return 'Add at least one defensive ticker - sweep runs both cash and defensive_asset modes.'
+      return 'Add at least one defensive ticker \u2013 sweep runs both cash and defensive_asset modes.'
     }
   } else {
     if (Number(form.top_n) <= 0) return 'Top N must be > 0.'

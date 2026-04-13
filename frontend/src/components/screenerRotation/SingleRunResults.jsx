@@ -1,4 +1,3 @@
-import { PreviewControls, PreviewGapRow } from './PreviewControls.jsx'
 import {
   BENCHMARK_COLOR,
   STRATEGY_COLOR,
@@ -6,13 +5,12 @@ import {
   allocationLabel,
   buildDateIndex,
   buildEquityCurvePoints,
-  buildPreviewState,
   colorVal,
   fmt,
   pct,
 } from './utils.js'
 
-export function SingleRunResults({ result, getSectionMode, setSectionMode }) {
+export function SingleRunResults({ result }) {
   if (!result) return null
 
   const metrics = result?.metrics ?? {}
@@ -24,8 +22,6 @@ export function SingleRunResults({ result, getSectionMode, setSectionMode }) {
   const universe = result?.universe ?? []
   const cashOnlyCount = rebalanceLog.filter((row) => row.cash_only).length
   const defensivePeriods = rebalanceLog.filter((row) => row.allocation_mode === 'defensive').length
-  const rebalancePreview = buildPreviewState(rebalanceLog, getSectionMode('single_rebalance'))
-  const tradesPreview = buildPreviewState(trades, getSectionMode('single_trades'))
 
   const chartWidth = 860
   const chartHeight = 260
@@ -280,75 +276,60 @@ export function SingleRunResults({ result, getSectionMode, setSectionMode }) {
         </div>
 
         {rebalanceLog.length > 0 ? (
-          <>
-            <PreviewControls
-              preview={rebalancePreview}
-              itemLabel="rebalance periods"
-              onModeChange={(mode) => setSectionMode('single_rebalance', mode)}
-            />
-            <div className="table-wrap">
-              <table className="table-compact">
-                <thead>
-                  <tr>
-                    <th>Date</th>
-                    <th>Mode</th>
-                    <th style={{ textAlign: 'right' }}>Eligible</th>
-                    <th>Allocation</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rebalancePreview.items.map((row, index) => (
-                    row?.__preview_gap ? (
-                      <PreviewGapRow
-                        key={`rebalance-gap-${row.hiddenCount}-${index}`}
-                        colSpan={4}
-                        hiddenCount={row.hiddenCount}
-                      />
-                    ) : (
-                      <tr key={`${row.date}-${index}`}>
-                        <td style={{ fontFamily: 'monospace' }}>{row.date}</td>
-                        <td>
-                          <span style={{ color: row.allocation_mode === 'defensive' ? BENCHMARK_COLOR : 'var(--text)' }}>
-                            {allocationLabel(row.allocation_mode)}
+          <div className="table-wrap">
+            <table className="table-compact">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Mode</th>
+                  <th style={{ textAlign: 'right' }}>Eligible</th>
+                  <th>Allocation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rebalanceLog.map((row, index) => (
+                  <tr key={`${row.date}-${index}`}>
+                    <td style={{ fontFamily: 'monospace' }}>{row.date}</td>
+                    <td>
+                      <span style={{ color: row.allocation_mode === 'defensive' ? BENCHMARK_COLOR : 'var(--text)' }}>
+                        {allocationLabel(row.allocation_mode)}
+                      </span>
+                    </td>
+                    <td
+                      style={{
+                        fontFamily: 'monospace',
+                        textAlign: 'right',
+                        color: 'var(--muted)',
+                      }}
+                    >
+                      {row.eligible_count}
+                    </td>
+                    <td>
+                      {row.cash_only ? (
+                        <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>cash only</span>
+                      ) : (
+                        Object.entries(row.weights ?? {}).map(([ticker, weight]) => (
+                          <span
+                            key={ticker}
+                            style={{
+                              display: 'inline-block',
+                              marginRight: 14,
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            <strong>{ticker}</strong>{' '}
+                            <span style={{ color: 'var(--muted)' }}>{pct(weight)}</span>
                           </span>
-                        </td>
-                        <td
-                          style={{
-                            fontFamily: 'monospace',
-                            textAlign: 'right',
-                            color: 'var(--muted)',
-                          }}
-                        >
-                          {row.eligible_count}
-                        </td>
-                        <td>
-                          {row.cash_only ? (
-                            <span style={{ color: 'var(--muted)', fontStyle: 'italic' }}>cash only</span>
-                          ) : (
-                            Object.entries(row.weights ?? {}).map(([ticker, weight]) => (
-                              <span
-                                key={ticker}
-                                style={{
-                                  display: 'inline-block',
-                                  marginRight: 14,
-                                  fontFamily: 'monospace',
-                                  fontSize: 12,
-                                  whiteSpace: 'nowrap',
-                                }}
-                              >
-                                <strong>{ticker}</strong>{' '}
-                                <span style={{ color: 'var(--muted)' }}>{pct(weight)}</span>
-                              </span>
-                            ))
-                          )}
-                        </td>
-                      </tr>
-                    )
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
+                        ))
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         ) : (
           <div className="empty">No rebalance periods were returned for this run.</div>
         )}
@@ -357,11 +338,6 @@ export function SingleRunResults({ result, getSectionMode, setSectionMode }) {
       {trades.length > 0 ? (
         <div className="card">
           <div className="card-title">Trades ({trades.length})</div>
-          <PreviewControls
-            preview={tradesPreview}
-            itemLabel="trades"
-            onModeChange={(mode) => setSectionMode('single_trades', mode)}
-          />
           <div className="table-wrap">
             <table className="table-compact">
               <thead>
@@ -375,41 +351,33 @@ export function SingleRunResults({ result, getSectionMode, setSectionMode }) {
                 </tr>
               </thead>
               <tbody>
-                {tradesPreview.items.map((trade, index) => (
-                  trade?.__preview_gap ? (
-                    <PreviewGapRow
-                      key={`trades-gap-${trade.hiddenCount}-${index}`}
-                      colSpan={6}
-                      hiddenCount={trade.hiddenCount}
-                    />
-                  ) : (
-                    <tr key={`${trade.date}-${trade.ticker}-${trade.action}-${index}`}>
-                      <td>{trade.date}</td>
-                      <td>
-                        <strong style={{ fontFamily: 'monospace' }}>{trade.ticker}</strong>
-                      </td>
-                      <td>
-                        <span className={`badge ${trade.action === 'sell' ? 'badge-sell' : 'badge-long'}`}>
-                          {trade.action?.toUpperCase()}
-                        </span>
-                      </td>
-                      <td style={{ fontFamily: 'monospace', textAlign: 'right' }}>
-                        {fmt(trade.shares, 4)}
-                      </td>
-                      <td style={{ fontFamily: 'monospace', textAlign: 'right' }}>
-                        {fmt(trade.price)}
-                      </td>
-                      <td
-                        style={{
-                          fontFamily: 'monospace',
-                          textAlign: 'right',
-                          color: 'var(--muted)',
-                        }}
-                      >
-                        {fmt(trade.commission)}
-                      </td>
-                    </tr>
-                  )
+                {trades.map((trade, index) => (
+                  <tr key={`${trade.date}-${trade.ticker}-${trade.action}-${index}`}>
+                    <td>{trade.date}</td>
+                    <td>
+                      <strong style={{ fontFamily: 'monospace' }}>{trade.ticker}</strong>
+                    </td>
+                    <td>
+                      <span className={`badge ${trade.action === 'sell' ? 'badge-sell' : 'badge-long'}`}>
+                        {trade.action?.toUpperCase()}
+                      </span>
+                    </td>
+                    <td style={{ fontFamily: 'monospace', textAlign: 'right' }}>
+                      {fmt(trade.shares, 4)}
+                    </td>
+                    <td style={{ fontFamily: 'monospace', textAlign: 'right' }}>
+                      {fmt(trade.price)}
+                    </td>
+                    <td
+                      style={{
+                        fontFamily: 'monospace',
+                        textAlign: 'right',
+                        color: 'var(--muted)',
+                      }}
+                    >
+                      {fmt(trade.commission)}
+                    </td>
+                  </tr>
                 ))}
               </tbody>
             </table>

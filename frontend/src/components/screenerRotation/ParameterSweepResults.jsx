@@ -1,15 +1,11 @@
-import { ExportButton } from './PreviewControls.jsx'
 import {
   BENCHMARK_COLOR,
   BEST_CELL_STYLE,
   absPct,
-  buildBaseExportMetadata,
   calcCalmar,
   colorVal,
-  exportVisibleCsv,
   fmt,
   isBestMetric,
-  parseSweepTopN,
   pct,
 } from './utils.js'
 
@@ -47,55 +43,12 @@ export function ParameterSweepResults({ sweepResult, form }) {
   ]
 
   const strategyTableRows = tableRows.filter((row) => !row.isBenchmark)
-  const exportRows = tableRows.map((row) => ({
-    experiment: row.label,
-    row_type: row.isBenchmark ? 'benchmark' : 'strategy',
-    top_n: row.top_n ?? '',
-    defensive_mode: row.defensive_mode ?? '',
-    final_equity: row.metrics.final_equity,
-    cagr: row.metrics.cagr,
-    sharpe_ratio: row.metrics.sharpe_ratio,
-    max_drawdown: row.metrics.max_drawdown,
-    calmar_ratio: row.metrics.calmar_ratio,
-    total_trades: row.metrics.total_trades ?? '',
-  }))
-
-  const exportSweepCsv = () => exportVisibleCsv({
-    form,
-    mode: 'parameter-sweep',
-    suffix: 'visible-results',
-    metadata: [
-      ...buildBaseExportMetadata(form, 'parameter_sweep'),
-      { key: 'date_from', value: form.date_from },
-      { key: 'date_to', value: form.date_to },
-      { key: 'top_n_values', value: parseSweepTopN(form.sweep_top_n).join('|') },
-      { key: 'defensive_modes', value: 'cash|defensive_asset' },
-      { key: 'ranking_mode', value: 'none' },
-      { key: 'visible_rows_exported', value: exportRows.length },
-    ],
-    columns: [
-      { label: 'experiment', value: (row) => row.experiment },
-      { label: 'row_type', value: (row) => row.row_type },
-      { label: 'top_n', value: (row) => row.top_n },
-      { label: 'defensive_mode', value: (row) => row.defensive_mode },
-      { label: 'final_equity', value: (row) => row.final_equity },
-      { label: 'cagr', value: (row) => row.cagr },
-      { label: 'sharpe_ratio', value: (row) => row.sharpe_ratio },
-      { label: 'max_drawdown', value: (row) => row.max_drawdown },
-      { label: 'calmar_ratio', value: (row) => row.calmar_ratio },
-      { label: 'total_trades', value: (row) => row.total_trades },
-    ],
-    rows: exportRows,
-  })
 
   return (
     <div className="card">
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
-        <div className="card-title" style={{ marginBottom: 0 }}>
-          Parameter sweep - {totalRuns} experiments
-          &nbsp;-&nbsp;{form.date_from} to {form.date_to}
-        </div>
-        {successRows.length > 0 && <ExportButton onClick={exportSweepCsv} />}
+      <div className="card-title">
+        Parameter sweep - {totalRuns} experiments
+        &nbsp;&middot;&nbsp;{form.date_from} to {form.date_to}
       </div>
 
       {failedRows.length > 0 && (

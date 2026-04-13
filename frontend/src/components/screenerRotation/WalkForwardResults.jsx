@@ -1,34 +1,18 @@
-import { ExportButton, PreviewControls, PreviewGapRow } from './PreviewControls.jsx'
 import {
+  WINNER_STYLE,
   absPct,
-  buildBaseExportMetadata,
-  buildPreviewState,
+  average,
   colorVal,
-  exportVisibleCsv,
   fmt,
-  parseSweepTopN,
   pct,
-  visiblePreviewItems,
 } from './utils.js'
 
-const WINNER_STYLE = {
-  display: 'inline-block',
-  padding: '3px 10px',
-  borderRadius: 4,
-  fontSize: 12,
-  fontWeight: 700,
-  background: 'rgba(34, 197, 94, 0.12)',
-  color: 'var(--success)',
-  border: '1px solid rgba(34, 197, 94, 0.3)',
-}
-
-export function WalkForwardResults({ walkForwardResult, form, getSectionMode, setSectionMode }) {
+export function WalkForwardResults({ walkForwardResult }) {
   if (!walkForwardResult) return null
 
   const { folds, totalFolds } = walkForwardResult
   const successFolds = folds.filter((fold) => fold.testMetrics != null)
   const failedFolds = folds.filter((fold) => fold.error != null)
-  const foldsPreview = buildPreviewState(folds, getSectionMode('walk_forward_folds'))
 
   const oosValues = {
     cagr: successFolds.map((fold) => Number(fold.testMetrics?.cagr)).filter((value) => Number.isFinite(value)),
@@ -41,7 +25,6 @@ export function WalkForwardResults({ walkForwardResult, form, getSectionMode, se
     sharpe: successFolds.map((fold) => Number(fold.benchmarkMetrics?.sharpe_ratio)).filter((value) => Number.isFinite(value)),
     maxDD: successFolds.map((fold) => Number(fold.benchmarkMetrics?.max_drawdown)).filter((value) => Number.isFinite(value)),
   }
-  const average = (values) => (values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null)
 
   const oosAvg = {
     cagr: average(oosValues.cagr),
@@ -70,67 +53,6 @@ export function WalkForwardResults({ walkForwardResult, form, getSectionMode, se
       mostFrequentWinner = configKey
     }
   }
-
-  const visibleFoldRows = visiblePreviewItems(foldsPreview).map((fold) => ({
-    fold: fold.fold,
-    train_from: fold.trainFrom,
-    train_to: fold.trainTo,
-    test_from: fold.testFrom,
-    test_to: fold.testTo,
-    train_winner: fold.trainWinner ?? '',
-    train_avg_rank: fold.trainAvgRank ?? '',
-    oos_final_equity: fold.testMetrics?.final_equity ?? '',
-    oos_cagr: fold.testMetrics?.cagr ?? '',
-    oos_sharpe_ratio: fold.testMetrics?.sharpe_ratio ?? '',
-    oos_max_drawdown: fold.testMetrics?.max_drawdown ?? '',
-    oos_calmar_ratio: fold.testMetrics?.calmar_ratio ?? '',
-    benchmark_ticker: 'SPY',
-    benchmark_final_equity: fold.benchmarkMetrics?.final_equity ?? '',
-    benchmark_cagr: fold.benchmarkMetrics?.cagr ?? '',
-    benchmark_sharpe_ratio: fold.benchmarkMetrics?.sharpe_ratio ?? '',
-    benchmark_max_drawdown: fold.benchmarkMetrics?.max_drawdown ?? '',
-    error: fold.error ?? '',
-  }))
-
-  const exportWalkForwardCsv = () => exportVisibleCsv({
-    form,
-    mode: 'walk-forward',
-    suffix: 'visible-folds',
-    metadata: [
-      ...buildBaseExportMetadata(form, 'walk_forward'),
-      { key: 'data_start', value: form.wf_data_start },
-      { key: 'data_end', value: form.wf_data_end },
-      { key: 'train_years', value: form.wf_train_years },
-      { key: 'test_years', value: form.wf_test_years },
-      { key: 'step_years', value: form.wf_step_years },
-      { key: 'top_n_values', value: parseSweepTopN(form.sweep_top_n).join('|') },
-      { key: 'defensive_modes', value: 'cash|defensive_asset' },
-      { key: 'ranking_mode', value: 'winner chosen on training-window avg rank across cagr|sharpe|max_drawdown|calmar' },
-      { key: 'visible_rows_exported', value: visibleFoldRows.length },
-      { key: 'hidden_rows_omitted', value: foldsPreview.hiddenCount },
-    ],
-    columns: [
-      { label: 'fold', value: (row) => row.fold },
-      { label: 'train_from', value: (row) => row.train_from },
-      { label: 'train_to', value: (row) => row.train_to },
-      { label: 'test_from', value: (row) => row.test_from },
-      { label: 'test_to', value: (row) => row.test_to },
-      { label: 'train_winner', value: (row) => row.train_winner },
-      { label: 'train_avg_rank', value: (row) => row.train_avg_rank },
-      { label: 'oos_final_equity', value: (row) => row.oos_final_equity },
-      { label: 'oos_cagr', value: (row) => row.oos_cagr },
-      { label: 'oos_sharpe_ratio', value: (row) => row.oos_sharpe_ratio },
-      { label: 'oos_max_drawdown', value: (row) => row.oos_max_drawdown },
-      { label: 'oos_calmar_ratio', value: (row) => row.oos_calmar_ratio },
-      { label: 'benchmark_ticker', value: (row) => row.benchmark_ticker },
-      { label: 'benchmark_final_equity', value: (row) => row.benchmark_final_equity },
-      { label: 'benchmark_cagr', value: (row) => row.benchmark_cagr },
-      { label: 'benchmark_sharpe_ratio', value: (row) => row.benchmark_sharpe_ratio },
-      { label: 'benchmark_max_drawdown', value: (row) => row.benchmark_max_drawdown },
-      { label: 'error', value: (row) => row.error },
-    ],
-    rows: visibleFoldRows,
-  })
 
   return (
     <div className="card">
@@ -203,14 +125,6 @@ export function WalkForwardResults({ walkForwardResult, form, getSectionMode, se
           <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
             Fold details - train winner to out-of-sample performance
           </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
-            <ExportButton onClick={exportWalkForwardCsv} disabled={visibleFoldRows.length === 0} />
-          </div>
-          <PreviewControls
-            preview={foldsPreview}
-            itemLabel="folds"
-            onModeChange={(mode) => setSectionMode('walk_forward_folds', mode)}
-          />
           <div className="table-wrap">
             <table className="table-compact">
               <thead>
@@ -228,17 +142,7 @@ export function WalkForwardResults({ walkForwardResult, form, getSectionMode, se
                 </tr>
               </thead>
               <tbody>
-                {foldsPreview.items.map((fold, index) => {
-                  if (fold?.__preview_gap) {
-                    return (
-                      <PreviewGapRow
-                        key={`wf-gap-${fold.hiddenCount}-${index}`}
-                        colSpan={10}
-                        hiddenCount={fold.hiddenCount}
-                      />
-                    )
-                  }
-
+                {folds.map((fold) => {
                   const testMetrics = fold.testMetrics
                   const benchmarkMetrics = fold.benchmarkMetrics
 
