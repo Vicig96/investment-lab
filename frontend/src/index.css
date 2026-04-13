@@ -139,6 +139,7 @@ textarea { resize: vertical; min-height: 70px; font-family: monospace; }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-secondary { background: var(--border); color: var(--text); }
 .btn-secondary:hover:not(:disabled) { background: #363a4e; }
+.btn-compact { padding: 5px 10px; font-size: 12px; }
 
 /* Tables */
 .table-wrap { overflow-x: auto; }
@@ -168,6 +169,47 @@ td {
 
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: rgba(255,255,255,0.02); }
+
+.table-compact th { padding: 6px 8px; font-size: 10px; }
+.table-compact td { padding: 6px 8px; font-size: 12px; }
+
+.section-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.section-controls-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.section-controls-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.preview-gap-cell {
+  text-align: center;
+  color: var(--muted);
+  font-style: italic;
+  background: rgba(255,255,255,0.02);
+}
+
+.preset-gap-note {
+  color: transparent;
+  font-size: 0;
+}
+
+.preset-gap-note::before {
+  content: "... " attr(data-hidden) " preset tables hidden ...";
+  font-size: 13px;
+  color: var(--muted);
+}
 
 /* Status / alerts */
 .alert {

@@ -14,6 +14,11 @@ const DEFAULT = {
   warmup_bars: '252',
   defensive_mode: 'cash',
   defensive_tickers: 'TLT, GLD',
+  wf_data_start: '2018-01-01',
+  wf_data_end: '2023-12-31',
+  wf_train_years: '2',
+  wf_test_years: '1',
+  wf_step_years: '1',
 }
 
 // ── Predefined experiment windows ────────────────────────────────────────────
@@ -154,6 +159,26 @@ function validate(form) {
       return 'Add at least one defensive ticker — cross-preset runs both cash and defensive_asset.'
     }
     return null  // dates not needed — presets provide them
+  }
+
+  if (form.run_mode === 'walk_forward') {
+    if (!form.wf_data_start) return '"Data start" date is required.'
+    if (!form.wf_data_end) return '"Data end" date is required.'
+    if (form.wf_data_start >= form.wf_data_end) return '"Data start" must be before "Data end".'
+    const topNValues = parseSweepTopN(form.sweep_top_n)
+    if (!topNValues.length) return 'Enter at least one valid Top N value (1–20).'
+    if (parseTickerList(form.defensive_tickers).length === 0) {
+      return 'Add at least one defensive ticker — walk-forward runs both cash and defensive_asset.'
+    }
+    const trainYears = parseInt(form.wf_train_years, 10)
+    const testYears = parseInt(form.wf_test_years, 10)
+    const stepYears = parseInt(form.wf_step_years, 10)
+    if (!trainYears || trainYears < 1) return 'Train years must be >= 1.'
+    if (!testYears || testYears < 1) return 'Test years must be >= 1.'
+    if (!stepYears || stepYears < 1) return 'Step years must be >= 1.'
+    const windows = generateWalkForwardWindows(form.wf_data_start, form.wf_data_end, trainYears, testYears, stepYears)
+    if (!windows.length) return 'No valid walk-forward windows fit within the data range. Increase the date range or decrease train/test years.'
+    return null
   }
 
   if (!form.date_from) return '"From" date is required.'
@@ -350,6 +375,216 @@ function DeltaCell({ value, format }) {
   )
 }
 
+// ── Walk-forward helpers ─────────────────────────────────────────────────────
+
+function toDateStr(d) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function generateWalkForwardWindows(dataStart, dataEnd, trainYears, testYears, stepYears) {
+  const windows = []
+  const endDate = new Date(dataEnd + 'T00:00:00')
+  let cursor = new Date(dataStart + 'T00:00:00')
+  let foldIndex = 1
+
+  while (true) {
+    const trainFrom = new Date(cursor)
+    const testStart = new Date(cursor)
+    testStart.setFullYear(testStart.getFullYear() + trainYears)
+
+    const trainTo = new Date(testStart)
+    trainTo.setDate(trainTo.getDate() - 1)
+
+    const testEnd = new Date(testStart)
+    testEnd.setFullYear(testEnd.getFullYear() + testYears)
+    testEnd.setDate(testEnd.getDate() - 1)
+
+    if (testEnd > endDate) break
+
+    windows.push({
+      foldIndex,
+      trainFrom: toDateStr(trainFrom),
+      trainTo: toDateStr(trainTo),
+      testFrom: toDateStr(testStart),
+      testTo: toDateStr(testEnd),
+    })
+
+    cursor.setFullYear(cursor.getFullYear() + stepYears)
+    foldIndex++
+  }
+
+  return windows
+}
+
+// Rank configs within a single window by 4 metrics (same logic as cross-preset).
+// Returns { configKey, avgRank } for the best config.
+function pickBestConfig(configResults) {
+  if (!configResults.length) return null
+  const METRICS = [
+    { key: 'cagr', higher: true },
+    { key: 'sharpe_ratio', higher: true },
+    { key: 'max_drawdown', higher: false },
+    { key: 'calmar_ratio', higher: true },
+  ]
+
+  const n = configResults.length
+  const totals = new Array(n).fill(0)
+  let metricsUsed = 0
+
+  for (const metric of METRICS) {
+    const values = configResults.map((r) => {
+      const v = numericValue(r.metrics[metric.key])
+      if (v == null) return null
+      return metric.key === 'max_drawdown' ? Math.abs(v) : v
+    })
+    const isHigher = metric.key === 'max_drawdown' ? false : metric.higher
+    const ranks = denseRank(values, isHigher)
+    let anyRank = false
+    for (let i = 0; i < n; i++) {
+      if (ranks[i] != null) { totals[i] += ranks[i]; anyRank = true }
+    }
+    if (anyRank) metricsUsed++
+  }
+
+  if (metricsUsed === 0) return { configKey: configResults[0].configKey, avgRank: null }
+
+  let bestIdx = 0
+  let bestScore = Infinity
+  for (let i = 0; i < n; i++) {
+    const avg = totals[i] / metricsUsed
+    if (avg < bestScore) { bestScore = avg; bestIdx = i }
+  }
+
+  return { configKey: configResults[bestIdx].configKey, avgRank: bestScore }
+}
+
+// Parse a configKey like "Top 2 · Defensive" back into { top_n, defensive_mode }
+function parseConfigKey(configKey) {
+  const match = configKey.match(/Top\s+(\d+)\s+·\s+(Cash|Defensive)/)
+  if (!match) return { top_n: 1, defensive_mode: 'cash' }
+  return {
+    top_n: parseInt(match[1], 10),
+    defensive_mode: match[2] === 'Cash' ? 'cash' : 'defensive_asset',
+  }
+}
+
+function summarizePreviewItems(items, headCount, tailCount = 0) {
+  const total = Array.isArray(items) ? items.length : 0
+  if (total === 0) return { items: [], shownCount: 0, hiddenCount: 0 }
+  if (total <= headCount) return { items, shownCount: total, hiddenCount: 0 }
+  if (tailCount <= 0 || total <= headCount + tailCount) {
+    const visibleItems = items.slice(0, Math.min(total, headCount))
+    return {
+      items: visibleItems,
+      shownCount: visibleItems.length,
+      hiddenCount: total - visibleItems.length,
+    }
+  }
+
+  const hiddenCount = total - headCount - tailCount
+  return {
+    items: [
+      ...items.slice(0, headCount),
+      { __preview_gap: true, hiddenCount },
+      ...items.slice(-tailCount),
+    ],
+    shownCount: headCount + tailCount,
+    hiddenCount,
+  }
+}
+
+function buildPreviewState(items, mode, options = {}) {
+  const total = Array.isArray(items) ? items.length : 0
+  const currentMode = mode ?? 'preview'
+  const previewHead = options.previewHead ?? 10
+  const previewTail = options.previewTail ?? 10
+  const moreHead = options.moreHead ?? 25
+  const moreTail = options.moreTail ?? 25
+
+  if (currentMode === 'all') {
+    return {
+      mode: currentMode,
+      total,
+      shownCount: total,
+      hiddenCount: 0,
+      items,
+      canShowMore: false,
+      canShowAll: false,
+      canCollapse: total > previewHead,
+    }
+  }
+
+  const summary = currentMode === 'more'
+    ? summarizePreviewItems(items, moreHead, moreTail)
+    : summarizePreviewItems(items, previewHead, previewTail)
+
+  return {
+    mode: currentMode,
+    total,
+    ...summary,
+    canShowMore: currentMode === 'preview' && total > summary.shownCount,
+    canShowAll: currentMode !== 'all' && total > summary.shownCount,
+    canCollapse: currentMode !== 'preview' && total > previewHead,
+  }
+}
+
+function PreviewControls({ preview, itemLabel = 'rows', onModeChange }) {
+  if (!preview) return null
+  if (!preview.canShowMore && !preview.canShowAll && !preview.canCollapse) return null
+
+  return (
+    <div className="section-controls">
+      <span className="section-controls-note">
+        {preview.mode === 'all'
+          ? `Showing all ${preview.total} ${itemLabel}.`
+          : `Showing ${preview.shownCount} of ${preview.total} ${itemLabel}.`}
+      </span>
+      <div className="section-controls-actions">
+        {preview.canShowMore && (
+          <button
+            type="button"
+            className="btn btn-secondary btn-compact"
+            onClick={() => onModeChange('more')}
+          >
+            Show more
+          </button>
+        )}
+        {preview.canShowAll && (
+          <button
+            type="button"
+            className="btn btn-secondary btn-compact"
+            onClick={() => onModeChange('all')}
+          >
+            Show all
+          </button>
+        )}
+        {preview.canCollapse && (
+          <button
+            type="button"
+            className="btn btn-secondary btn-compact"
+            onClick={() => onModeChange('preview')}
+          >
+            Collapse
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function PreviewGapRow({ colSpan, hiddenCount }) {
+  return (
+    <tr>
+      <td colSpan={colSpan} className="preview-gap-cell">
+        â€¦ {hiddenCount} row{hiddenCount !== 1 ? 's' : ''} hidden â€¦
+      </td>
+    </tr>
+  )
+}
+
 export default function ScreenerRotation() {
   const [form, setForm] = useState(DEFAULT)
   const [loading, setLoading] = useState(false)
@@ -359,11 +594,19 @@ export default function ScreenerRotation() {
   const [comparisonResult, setComparisonResult] = useState(null)
   const [sweepResult, setSweepResult] = useState(null)
   const [crossPresetResult, setCrossPresetResult] = useState(null)
+  const [walkForwardResult, setWalkForwardResult] = useState(null)
+  const [sectionModes, setSectionModes] = useState({})
 
   const setField = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }))
     setFormError(null)
   }
+
+  const setSectionMode = (key, mode) => {
+    setSectionModes((prev) => ({ ...prev, [key]: mode }))
+  }
+
+  const getSectionMode = (key) => sectionModes[key] ?? 'preview'
 
   const submit = async (event) => {
     event.preventDefault()
@@ -381,6 +624,8 @@ export default function ScreenerRotation() {
     setComparisonResult(null)
     setSweepResult(null)
     setCrossPresetResult(null)
+    setWalkForwardResult(null)
+    setSectionModes({})
 
     try {
       const basePayload = buildBasePayload(form)
@@ -474,6 +719,111 @@ export default function ScreenerRotation() {
         }))
 
         setCrossPresetResult({ results, totalRuns: jobs.length })
+      } else if (form.run_mode === 'walk_forward') {
+        const trainYears = parseInt(form.wf_train_years, 10) || 2
+        const testYears = parseInt(form.wf_test_years, 10) || 1
+        const stepYears = parseInt(form.wf_step_years, 10) || 1
+        const windows = generateWalkForwardWindows(
+          form.wf_data_start, form.wf_data_end, trainYears, testYears, stepYears,
+        )
+
+        const topNValues = parseSweepTopN(form.sweep_top_n)
+        const defensiveModes = ['cash', 'defensive_asset']
+        const folds = []
+
+        for (const win of windows) {
+          // Phase 1: run all configs on the training window in parallel
+          const trainConfigs = topNValues.flatMap((topN) =>
+            defensiveModes.map((defMode) => ({
+              configKey: `Top ${topN} · ${defMode === 'cash' ? 'Cash' : 'Defensive'}`,
+              top_n: topN,
+              defensive_mode: defMode,
+              payload: {
+                ...basePayload,
+                date_from: win.trainFrom,
+                date_to: win.trainTo,
+                top_n: topN,
+                defensive_mode: defMode,
+              },
+            })),
+          )
+
+          const trainSettled = await Promise.allSettled(
+            trainConfigs.map((c) => runScreenerRotation(c.payload)),
+          )
+
+          const trainResults = trainConfigs
+            .map((c, i) => ({
+              configKey: c.configKey,
+              metrics: trainSettled[i].status === 'fulfilled'
+                ? trainSettled[i].value.metrics
+                : null,
+            }))
+            .filter((r) => r.metrics != null)
+
+          const bestPick = pickBestConfig(trainResults)
+
+          if (!bestPick) {
+            folds.push({
+              fold: win.foldIndex,
+              trainFrom: win.trainFrom,
+              trainTo: win.trainTo,
+              testFrom: win.testFrom,
+              testTo: win.testTo,
+              trainWinner: null,
+              trainAvgRank: null,
+              trainConfigCount: trainConfigs.length,
+              testMetrics: null,
+              benchmarkMetrics: null,
+              error: 'All training configs failed.',
+            })
+            continue
+          }
+
+          // Phase 2: run winning config on the test window
+          const winnerParams = parseConfigKey(bestPick.configKey)
+          const testPayload = {
+            ...basePayload,
+            date_from: win.testFrom,
+            date_to: win.testTo,
+            top_n: winnerParams.top_n,
+            defensive_mode: winnerParams.defensive_mode,
+          }
+
+          let testResult = null
+          let benchmarkMetrics = null
+          let foldError = null
+
+          try {
+            testResult = await runScreenerRotation(testPayload)
+            benchmarkMetrics = testResult.benchmark
+              ? {
+                final_equity: testResult.benchmark.final_equity,
+                cagr: testResult.benchmark.cagr,
+                sharpe_ratio: testResult.benchmark.sharpe_ratio,
+                max_drawdown: testResult.benchmark.max_drawdown,
+              }
+              : null
+          } catch (err) {
+            foldError = err.message
+          }
+
+          folds.push({
+            fold: win.foldIndex,
+            trainFrom: win.trainFrom,
+            trainTo: win.trainTo,
+            testFrom: win.testFrom,
+            testTo: win.testTo,
+            trainWinner: bestPick.configKey,
+            trainAvgRank: bestPick.avgRank,
+            trainConfigCount: trainConfigs.length,
+            testMetrics: testResult?.metrics ?? null,
+            benchmarkMetrics,
+            error: foldError,
+          })
+        }
+
+        setWalkForwardResult({ folds, totalFolds: windows.length })
       } else {
         const data = await runScreenerRotation({
           ...basePayload,
@@ -498,6 +848,8 @@ export default function ScreenerRotation() {
   const universe = result?.universe ?? []
   const cashOnlyCount = rebalanceLog.filter((row) => row.cash_only).length
   const defensivePeriods = rebalanceLog.filter((row) => row.allocation_mode === 'defensive').length
+  const rebalancePreview = buildPreviewState(rebalanceLog, getSectionMode('single_rebalance'))
+  const tradesPreview = buildPreviewState(trades, getSectionMode('single_trades'))
 
   const chartWidth = 860
   const chartHeight = 260
@@ -601,6 +953,7 @@ export default function ScreenerRotation() {
                 <option value="compare_variants">Compare variants</option>
                 <option value="parameter_sweep">Parameter sweep</option>
                 <option value="cross_preset">Cross-preset ranking</option>
+                <option value="walk_forward">Walk-forward test</option>
               </select>
             </div>
           </div>
@@ -617,11 +970,21 @@ export default function ScreenerRotation() {
             />
           </div>
 
-          {/* ── Preset windows (hidden in cross-preset — it runs all automatically) ── */}
-          {form.run_mode !== 'cross_preset' && (
+          {/* ── Preset windows (hidden in cross-preset and walk-forward) ── */}
+          {form.run_mode !== 'cross_preset' && form.run_mode !== 'walk_forward' && (
             <div className="field">
               <label>Preset windows</label>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {presetDetailCards.length > 0 && (
+                  <div className="card">
+                    <div className="card-title">Per-preset detail tables</div>
+                    <PreviewControls
+                      preview={presetDetailPreview}
+                      itemLabel="preset tables"
+                      onModeChange={(mode) => setSectionMode('cross_preset_details', mode)}
+                    />
+                  </div>
+                )}
                 {PRESET_WINDOWS.map((preset) => {
                   const active =
                     form.date_from === preset.date_from &&
@@ -663,7 +1026,7 @@ export default function ScreenerRotation() {
             </div>
           )}
 
-          {form.run_mode !== 'cross_preset' && (
+          {form.run_mode !== 'cross_preset' && form.run_mode !== 'walk_forward' && (
             <div className="form-row">
               <div className="field">
                 <label>From *</label>
@@ -727,6 +1090,78 @@ export default function ScreenerRotation() {
               </div>
             </div>
           )}
+          {form.run_mode === 'walk_forward' && (
+            <>
+              <div className="form-row">
+                <div className="field">
+                  <label>Data start *</label>
+                  <input
+                    type="date"
+                    value={form.wf_data_start}
+                    onChange={(event) => setField('wf_data_start', event.target.value)}
+                    required
+                    disabled={loading}
+                  />
+                </div>
+                <div className="field">
+                  <label>Data end *</label>
+                  <input
+                    type="date"
+                    value={form.wf_data_end}
+                    onChange={(event) => setField('wf_data_end', event.target.value)}
+                    required
+                    disabled={loading}
+                  />
+                </div>
+                <div className="field" style={{ maxWidth: 220 }}>
+                  <label>Top N values (comma-separated)</label>
+                  <input
+                    type="text"
+                    value={form.sweep_top_n}
+                    onChange={(event) => setField('sweep_top_n', event.target.value)}
+                    placeholder="1,2,3"
+                    spellCheck={false}
+                    disabled={loading}
+                  />
+                </div>
+              </div>
+              <div className="form-row">
+                <div className="field" style={{ maxWidth: 140 }}>
+                  <label>Train (years)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="10"
+                    value={form.wf_train_years}
+                    onChange={(event) => setField('wf_train_years', event.target.value)}
+                    disabled={loading}
+                  />
+                </div>
+                <div className="field" style={{ maxWidth: 140 }}>
+                  <label>Test (years)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="10"
+                    value={form.wf_test_years}
+                    onChange={(event) => setField('wf_test_years', event.target.value)}
+                    disabled={loading}
+                  />
+                </div>
+                <div className="field" style={{ maxWidth: 140 }}>
+                  <label>Step (years)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="10"
+                    value={form.wf_step_years}
+                    onChange={(event) => setField('wf_step_years', event.target.value)}
+                    disabled={loading}
+                  />
+                </div>
+              </div>
+            </>
+          )}
 
           <div className="form-row">
             <div className="field">
@@ -773,7 +1208,7 @@ export default function ScreenerRotation() {
           </div>
 
           <div className="form-row">
-            {form.run_mode !== 'parameter_sweep' && form.run_mode !== 'cross_preset' && (
+            {form.run_mode !== 'parameter_sweep' && form.run_mode !== 'cross_preset' && form.run_mode !== 'walk_forward' && (
               <div className="field" style={{ maxWidth: 220 }}>
                 <label>Defensive behavior</label>
                 <select
@@ -826,6 +1261,29 @@ export default function ScreenerRotation() {
               </div>
             )
           })()}
+          {form.run_mode === 'walk_forward' && (() => {
+            const trainYears = parseInt(form.wf_train_years, 10) || 0
+            const testYears = parseInt(form.wf_test_years, 10) || 0
+            const stepYears = parseInt(form.wf_step_years, 10) || 0
+            const nConfigs = parseSweepTopN(form.sweep_top_n).length * 2
+            const wins = (trainYears >= 1 && testYears >= 1 && stepYears >= 1 && form.wf_data_start && form.wf_data_end)
+              ? generateWalkForwardWindows(form.wf_data_start, form.wf_data_end, trainYears, testYears, stepYears)
+              : []
+            return (
+              <div style={{ marginBottom: 12, color: 'var(--muted)', fontSize: 13 }}>
+                Rolling walk-forward: {trainYears}y train → {testYears}y test, stepping {stepYears}y forward each fold.
+                {' '}{wins.length > 0
+                  ? <>
+                      <strong style={{ color: 'var(--text)' }}>
+                        {wins.length} fold{wins.length !== 1 ? 's' : ''}
+                      </strong>
+                      {' '}× {nConfigs} configs = {wins.length * nConfigs} training runs + {wins.length} OOS tests.
+                    </>
+                  : <span style={{ color: 'var(--warning)' }}>No valid folds for this date range.</span>
+                }
+              </div>
+            )
+          })()}
 
           {formError && <div className="field-error">{formError}</div>}
 
@@ -838,7 +1296,9 @@ export default function ScreenerRotation() {
                   ? 'Run Sweep'
                   : form.run_mode === 'cross_preset'
                     ? 'Run Cross-Preset Ranking'
-                    : 'Run Backtest'}
+                    : form.run_mode === 'walk_forward'
+                      ? 'Run Walk-Forward Test'
+                      : 'Run Backtest'}
             </button>
           </div>
         </form>
@@ -846,7 +1306,7 @@ export default function ScreenerRotation() {
         {error && <div className="alert alert-error" style={{ marginTop: 12 }}>{error}</div>}
       </div>
 
-      {!singleResult && !comparisonResult && !sweepResult && !crossPresetResult && !loading && !error && (
+      {!singleResult && !comparisonResult && !sweepResult && !crossPresetResult && !walkForwardResult && !loading && !error && (
         <div className="empty" style={{ paddingTop: 40 }}>
           Configure the parameters above and choose a run mode.
         </div>
@@ -860,7 +1320,9 @@ export default function ScreenerRotation() {
               ? `Running ${parseSweepTopN(form.sweep_top_n).length * 2} sweep experiments in parallel. Results will appear after all runs complete.`
               : form.run_mode === 'cross_preset'
                 ? `Running ${PRESET_WINDOWS.length * parseSweepTopN(form.sweep_top_n).length * 2} experiments across ${PRESET_WINDOWS.length} preset windows. This may take a moment.`
-                : 'Running screener rotation backtest...'}
+                : form.run_mode === 'walk_forward'
+                  ? 'Running walk-forward folds sequentially (training sweep → OOS test per fold). This may take a moment.'
+                  : 'Running screener rotation backtest...'}
         </div>
       )}
 
@@ -1219,6 +1681,32 @@ export default function ScreenerRotation() {
           }
         }
 
+        const rankingPreview = buildPreviewState(ranked, getSectionMode('cross_preset_ranking'))
+        const presetDetailCards = PRESET_WINDOWS
+          .map((preset) => {
+            const presetRows = configKeys
+              .map((ck) => ({
+                configKey: ck,
+                metrics: resultsByConfig.get(ck)?.get(preset.label) ?? null,
+              }))
+              .filter((r) => r.metrics != null)
+              .map((r) => ({
+                key: r.configKey,
+                label: r.configKey,
+                isBenchmark: false,
+                metrics: r.metrics,
+              }))
+
+            if (!presetRows.length) return null
+            return { preset, presetRows }
+          })
+          .filter(Boolean)
+        const presetDetailPreview = buildPreviewState(
+          presetDetailCards,
+          getSectionMode('cross_preset_details'),
+          { previewHead: 1, previewTail: 0, moreHead: 2, moreTail: 0 },
+        )
+
         const WINNER_STYLE = {
           display: 'inline-block',
           padding: '3px 10px',
@@ -1309,8 +1797,13 @@ export default function ScreenerRotation() {
                   <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
                     Overall ranking — lower average rank is better
                   </div>
+                  <PreviewControls
+                    preview={rankingPreview}
+                    itemLabel="ranked configs"
+                    onModeChange={(mode) => setSectionMode('cross_preset_ranking', mode)}
+                  />
                   <div className="table-wrap">
-                    <table>
+                    <table className="table-compact">
                       <thead>
                         <tr>
                           <th style={{ width: 28 }}>#</th>
@@ -1324,9 +1817,20 @@ export default function ScreenerRotation() {
                         </tr>
                       </thead>
                       <tbody>
-                        {ranked.map((row, i) => {
+                        {rankingPreview.items.map((row, i) => {
+                          if (row?.__preview_gap) {
+                            return (
+                              <PreviewGapRow
+                                key={`cross-preset-gap-${row.hiddenCount}-${i}`}
+                                colSpan={PRESET_WINDOWS.length + 3}
+                                hiddenCount={row.hiddenCount}
+                              />
+                            )
+                          }
+
+                          const absoluteIndex = ranked.findIndex((entry) => entry.configKey === row.configKey)
                           const s = scores.get(row.configKey)
-                          const isWinner = i === 0
+                          const isWinner = absoluteIndex === 0
                           return (
                             <tr
                               key={row.configKey}
@@ -1334,7 +1838,7 @@ export default function ScreenerRotation() {
                                 ? { background: 'rgba(34, 197, 94, 0.06)' }
                                 : undefined}
                             >
-                              <td style={{ color: 'var(--muted)', fontSize: 12 }}>{i + 1}</td>
+                              <td style={{ color: 'var(--muted)', fontSize: 12 }}>{absoluteIndex + 1}</td>
                               <td>
                                 <strong style={{ color: isWinner ? 'var(--success)' : 'var(--text)' }}>
                                   {row.configKey}
@@ -1377,21 +1881,28 @@ export default function ScreenerRotation() {
                 </div>
 
                 {/* ── Detailed metrics per preset ── */}
-                {PRESET_WINDOWS.map((preset) => {
-                  const presetRows = configKeys
-                    .map((ck) => ({
-                      configKey: ck,
-                      metrics: resultsByConfig.get(ck)?.get(preset.label) ?? null,
-                    }))
-                    .filter((r) => r.metrics != null)
-                    .map((r) => ({
-                      key: r.configKey,
-                      label: r.configKey,
-                      isBenchmark: false,
-                      metrics: r.metrics,
-                    }))
+                {presetDetailCards.length > 0 && (
+                  <div className="card">
+                    <div className="card-title">Per-preset detail tables</div>
+                    <PreviewControls
+                      preview={presetDetailPreview}
+                      itemLabel="preset tables"
+                      onModeChange={(mode) => setSectionMode('cross_preset_details', mode)}
+                    />
+                  </div>
+                )}
+                {presetDetailPreview.items.map((detail, detailIndex) => {
+                  if (detail?.__preview_gap) {
+                    return (
+                      <div className="card" key={`preset-gap-${detail.hiddenCount}-${detailIndex}`}>
+                        <div className="empty preset-gap-note" data-hidden={detail.hiddenCount}>
+                          â€¦ {detail.hiddenCount} preset table{detail.hiddenCount !== 1 ? 's' : ''} hidden â€¦
+                        </div>
+                      </div>
+                    )
+                  }
 
-                  if (!presetRows.length) return null
+                  const { preset, presetRows } = detail
 
                   return (
                     <div className="card" key={preset.label}>
@@ -1402,7 +1913,7 @@ export default function ScreenerRotation() {
                         </span>
                       </div>
                       <div className="table-wrap">
-                        <table>
+                        <table className="table-compact">
                           <thead>
                             <tr>
                               <th>Configuration</th>
@@ -1449,6 +1960,226 @@ export default function ScreenerRotation() {
                 })}
               </>
             )}
+          </>
+        )
+      })()}
+
+      {/* ── Walk-forward results ────────────────────────────────────────── */}
+      {walkForwardResult && (() => {
+        const { folds, totalFolds } = walkForwardResult
+        const successFolds = folds.filter((f) => f.testMetrics != null)
+        const failedFolds = folds.filter((f) => f.error != null)
+        const foldsPreview = buildPreviewState(folds, getSectionMode('walk_forward_folds'))
+
+        // Aggregate OOS metrics across successful folds
+        const oosValues = {
+          cagr: successFolds.map((f) => numericValue(f.testMetrics?.cagr)).filter((v) => v != null),
+          sharpe: successFolds.map((f) => numericValue(f.testMetrics?.sharpe_ratio)).filter((v) => v != null),
+          maxDD: successFolds.map((f) => numericValue(f.testMetrics?.max_drawdown)).filter((v) => v != null),
+          calmar: successFolds.map((f) => numericValue(f.testMetrics?.calmar_ratio)).filter((v) => v != null),
+        }
+        const bmValues = {
+          cagr: successFolds.map((f) => numericValue(f.benchmarkMetrics?.cagr)).filter((v) => v != null),
+          sharpe: successFolds.map((f) => numericValue(f.benchmarkMetrics?.sharpe_ratio)).filter((v) => v != null),
+          maxDD: successFolds.map((f) => numericValue(f.benchmarkMetrics?.max_drawdown)).filter((v) => v != null),
+        }
+        const avg = (arr) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : null
+
+        const oosAvg = {
+          cagr: avg(oosValues.cagr),
+          sharpe: avg(oosValues.sharpe),
+          maxDD: avg(oosValues.maxDD),
+          calmar: avg(oosValues.calmar),
+        }
+        const bmAvg = {
+          cagr: avg(bmValues.cagr),
+          sharpe: avg(bmValues.sharpe),
+          maxDD: avg(bmValues.maxDD),
+        }
+
+        // Count which config was picked most frequently
+        const winnerCounts = new Map()
+        for (const f of successFolds) {
+          if (f.trainWinner) {
+            winnerCounts.set(f.trainWinner, (winnerCounts.get(f.trainWinner) || 0) + 1)
+          }
+        }
+        let mostFrequentWinner = null
+        let maxCount = 0
+        for (const [ck, count] of winnerCounts) {
+          if (count > maxCount) { maxCount = count; mostFrequentWinner = ck }
+        }
+
+        const WINNER_STYLE = {
+          display: 'inline-block',
+          padding: '3px 10px',
+          borderRadius: 4,
+          fontSize: 12,
+          fontWeight: 700,
+          background: 'rgba(34, 197, 94, 0.12)',
+          color: 'var(--success)',
+          border: '1px solid rgba(34, 197, 94, 0.3)',
+        }
+
+        return (
+          <>
+            {/* ── OOS summary ── */}
+            <div className="card">
+              <div className="card-title">
+                Walk-forward results — {totalFolds} fold{totalFolds !== 1 ? 's' : ''}
+              </div>
+
+              {failedFolds.length > 0 && (
+                <div className="alert alert-error" style={{ marginBottom: 12 }}>
+                  <strong>{failedFolds.length} fold{failedFolds.length !== 1 ? 's' : ''} failed:</strong>
+                  <ul style={{ margin: '6px 0 0 0', paddingLeft: 18 }}>
+                    {failedFolds.map((f) => (
+                      <li key={f.fold} style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                        Fold {f.fold} ({f.testFrom} → {f.testTo}) — {f.error}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {successFolds.length === 0 ? (
+                <div className="empty">All folds failed. Check the errors above.</div>
+              ) : (
+                <>
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
+                    gap: 12,
+                    marginBottom: 20,
+                  }}>
+                    <div className="metric-box">
+                      <div className="metric-label">Most frequent winner</div>
+                      <div className="metric-value" style={{ fontSize: 15 }}>
+                        <span style={WINNER_STYLE}>{mostFrequentWinner ?? '—'}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        picked in {maxCount} of {successFolds.length} fold{successFolds.length !== 1 ? 's' : ''}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Avg OOS CAGR</div>
+                      <div className="metric-value" style={{ color: colorVal(oosAvg.cagr) }}>
+                        {pct(oosAvg.cagr)}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        benchmark: {pct(bmAvg.cagr)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Avg OOS Sharpe</div>
+                      <div className="metric-value" style={{ color: colorVal(oosAvg.sharpe) }}>
+                        {fmt(oosAvg.sharpe)}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        benchmark: {fmt(bmAvg.sharpe)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Avg OOS Max DD</div>
+                      <div className="metric-value" style={{ color: 'var(--error)' }}>
+                        {absPct(oosAvg.maxDD)}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                        benchmark: {absPct(bmAvg.maxDD)}
+                      </div>
+                    </div>
+                    <div className="metric-box">
+                      <div className="metric-label">Avg OOS Calmar</div>
+                      <div className="metric-value">
+                        {fmt(oosAvg.calmar)}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ── Fold-by-fold table ── */}
+                  <div style={{ fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 8 }}>
+                    Fold details — train winner → out-of-sample performance
+                  </div>
+                  <PreviewControls
+                    preview={foldsPreview}
+                    itemLabel="folds"
+                    onModeChange={(mode) => setSectionMode('walk_forward_folds', mode)}
+                  />
+                  <div className="table-wrap">
+                    <table className="table-compact">
+                      <thead>
+                        <tr>
+                          <th>Fold</th>
+                          <th>Train window</th>
+                          <th>Test window</th>
+                          <th>Winner (train)</th>
+                          <th style={{ textAlign: 'right' }}>Avg rank</th>
+                          <th style={{ textAlign: 'right' }}>OOS CAGR</th>
+                          <th style={{ textAlign: 'right' }}>OOS Sharpe</th>
+                          <th style={{ textAlign: 'right' }}>OOS Max DD</th>
+                          <th style={{ textAlign: 'right' }}>OOS Calmar</th>
+                          <th style={{ textAlign: 'right' }}>BM CAGR</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {foldsPreview.items.map((f, index) => {
+                          if (f?.__preview_gap) {
+                            return (
+                              <PreviewGapRow
+                                key={`wf-gap-${f.hiddenCount}-${index}`}
+                                colSpan={10}
+                                hiddenCount={f.hiddenCount}
+                              />
+                            )
+                          }
+                          const tm = f.testMetrics
+                          const bm = f.benchmarkMetrics
+                          return (
+                            <tr key={f.fold} style={f.error && !tm ? { opacity: 0.5 } : undefined}>
+                              <td style={{ fontFamily: 'monospace', color: 'var(--muted)' }}>{f.fold}</td>
+                              <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                                {f.trainFrom} → {f.trainTo}
+                              </td>
+                              <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                                {f.testFrom} → {f.testTo}
+                              </td>
+                              <td>
+                                {f.trainWinner
+                                  ? <strong style={{ color: 'var(--success)' }}>{f.trainWinner}</strong>
+                                  : <span style={{ color: 'var(--error)', fontStyle: 'italic' }}>failed</span>
+                                }
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--muted)' }}>
+                                {f.trainAvgRank != null ? f.trainAvgRank.toFixed(2) : '—'}
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(tm?.cagr) }}>
+                                {tm ? pct(tm.cagr) : '—'}
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(tm?.sharpe_ratio) }}>
+                                {tm ? fmt(tm.sharpe_ratio) : '—'}
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: 'monospace', color: 'var(--error)' }}>
+                                {tm ? absPct(tm.max_drawdown) : '—'}
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: 'monospace' }}>
+                                {tm ? fmt(tm.calmar_ratio) : '—'}
+                              </td>
+                              <td style={{ textAlign: 'right', fontFamily: 'monospace', color: colorVal(bm?.cagr) }}>
+                                {bm ? pct(bm.cagr) : '—'}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 12, color: 'var(--muted)' }}>
+                    Each fold: all configs compete on the training window → winner is tested on the subsequent out-of-sample window.
+                    BM = SPY buy-and-hold benchmark over the same test period.
+                  </div>
+                </>
+              )}
+            </div>
           </>
         )
       })()}
@@ -1676,8 +2407,14 @@ export default function ScreenerRotation() {
             </div>
 
             {rebalanceLog.length > 0 ? (
+              <>
+                <PreviewControls
+                  preview={rebalancePreview}
+                  itemLabel="rebalance periods"
+                  onModeChange={(mode) => setSectionMode('single_rebalance', mode)}
+                />
               <div className="table-wrap">
-                <table>
+                <table className="table-compact">
                   <thead>
                     <tr>
                       <th>Date</th>
@@ -1687,8 +2424,15 @@ export default function ScreenerRotation() {
                     </tr>
                   </thead>
                   <tbody>
-                    {rebalanceLog.map((row, index) => (
-                      <tr key={index}>
+                    {rebalancePreview.items.map((row, index) => (
+                      row?.__preview_gap ? (
+                        <PreviewGapRow
+                          key={`rebalance-gap-${row.hiddenCount}-${index}`}
+                          colSpan={4}
+                          hiddenCount={row.hiddenCount}
+                        />
+                      ) : (
+                      <tr key={`${row.date}-${index}`}>
                         <td style={{ fontFamily: 'monospace' }}>{row.date}</td>
                         <td>
                           <span style={{ color: row.allocation_mode === 'defensive' ? BENCHMARK_COLOR : 'var(--text)' }}>
@@ -1726,10 +2470,12 @@ export default function ScreenerRotation() {
                           )}
                         </td>
                       </tr>
+                      )
                     ))}
                   </tbody>
                 </table>
               </div>
+              </>
             ) : (
               <div className="empty">No rebalance periods were returned for this run.</div>
             )}
@@ -1738,8 +2484,13 @@ export default function ScreenerRotation() {
           {trades.length > 0 ? (
             <div className="card">
               <div className="card-title">Trades ({trades.length})</div>
+              <PreviewControls
+                preview={tradesPreview}
+                itemLabel="trades"
+                onModeChange={(mode) => setSectionMode('single_trades', mode)}
+              />
               <div className="table-wrap">
-                <table>
+                <table className="table-compact">
                   <thead>
                     <tr>
                       <th>Date</th>
@@ -1751,8 +2502,15 @@ export default function ScreenerRotation() {
                     </tr>
                   </thead>
                   <tbody>
-                    {trades.map((trade, index) => (
-                      <tr key={index}>
+                    {tradesPreview.items.map((trade, index) => (
+                      trade?.__preview_gap ? (
+                        <PreviewGapRow
+                          key={`trades-gap-${trade.hiddenCount}-${index}`}
+                          colSpan={6}
+                          hiddenCount={trade.hiddenCount}
+                        />
+                      ) : (
+                      <tr key={`${trade.date}-${trade.ticker}-${trade.action}-${index}`}>
                         <td>{trade.date}</td>
                         <td>
                           <strong style={{ fontFamily: 'monospace' }}>{trade.ticker}</strong>
@@ -1778,6 +2536,7 @@ export default function ScreenerRotation() {
                           {fmt(trade.commission)}
                         </td>
                       </tr>
+                      )
                     ))}
                   </tbody>
                 </table>
