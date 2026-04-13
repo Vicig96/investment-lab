@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import instruments, prices, indicators, signals, backtest, portfolio, screener, screener_backtest
+from app.api.v1 import backtest, copilot, indicators, instruments, portfolio, prices, screener, screener_backtest, signals
 
 router = APIRouter(prefix="/api/v1")
 
@@ -12,3 +12,4 @@ router.include_router(backtest.router)
 router.include_router(portfolio.router)
 router.include_router(screener.router)
 router.include_router(screener_backtest.router)
+router.include_router(copilot.router)

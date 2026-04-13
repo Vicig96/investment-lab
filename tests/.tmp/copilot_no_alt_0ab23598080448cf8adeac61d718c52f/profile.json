@@ -1,0 +1,1 @@
+{"profile_name":"Blocked","investment_objective":"Protect capital","time_horizon":"5y","risk_tolerance":"low","max_acceptable_drawdown":0.03,"preferred_assets":["SPY"],"disallowed_assets":["QQQ"],"preferred_strategy_bias":"defensive","liquidity_needs":"high","notes":"Blocked"}

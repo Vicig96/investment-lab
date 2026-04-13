@@ -1,0 +1,1 @@
+{"profile_name": "Blocked QQQ Profile", "investment_objective": "Compound capital carefully", "time_horizon": "5y", "risk_tolerance": "moderate", "max_acceptable_drawdown": 0.25, "preferred_assets": ["SPY"], "disallowed_assets": ["QQQ"], "preferred_strategy_bias": "robust defensive rotation", "liquidity_needs": "high", "notes": "Block QQQ but allow core broad-market ETFs."}

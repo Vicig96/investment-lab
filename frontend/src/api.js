@@ -69,3 +69,4 @@ export const runScreener = (body) => post('/screener/run', body)
 
 // ── Screener Rotation Backtest ────────────────────────────────────────────────
 export const runScreenerRotation = (body) => post('/screener/rotation/run', body)
+export const runCopilotChat = (body) => post('/copilot/chat', body)

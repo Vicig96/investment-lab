@@ -1,0 +1,1 @@
+{"profile_name":"Integration Profile","investment_objective":"Compound capital","time_horizon":"5y","risk_tolerance":"moderate","max_acceptable_drawdown":0.25,"preferred_assets":["SPY"],"disallowed_assets":["TQQQ"],"preferred_strategy_bias":"defensive","liquidity_needs":"high","notes":"Test"}
