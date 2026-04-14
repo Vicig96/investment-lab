@@ -45,10 +45,26 @@ from app.schemas.copilot import (
     WalkForwardFoldSummary,
     WalkForwardSummary,
 )
+from app.schemas.copilot_comparative_validation import ComparativeValidationRequest
+from app.schemas.copilot_forward_validation_pilot import ForwardValidationPilotRequest
+from app.schemas.copilot_monitoring import MonitoringRunRequest
+from app.schemas.copilot_outcomes import OutcomeReviewRequest
+from app.schemas.copilot_paper_portfolio_nav import PaperPortfolioNavRequest
+from app.schemas.copilot_scorecard import ScorecardRequest
+from app.schemas.copilot_shadow_portfolio import ShadowPortfolioRequest
+from app.services import copilot_comparative_validation as comparative_validation_service
+from app.services import copilot_forward_validation_pilot as forward_validation_service
+from app.services import copilot_monitoring as monitoring_service
+from app.services import copilot_outcomes as outcome_service
+from app.services import copilot_paper_portfolio_nav as paper_portfolio_nav_service
+from app.services import copilot_scorecard as scorecard_service
+from app.services import copilot_shadow_portfolio as shadow_portfolio_service
 from app.services.backtest.metrics import compute_all_metrics
 from app.services.copilot_personalization import (
+    evaluate_portfolio_context,
     evaluate_policy_context,
     load_investor_profile,
+    load_local_portfolio,
     query_local_knowledge_base,
 )
 from app.services.screener.rotation import run_buy_and_hold_benchmark, run_rotation
@@ -90,7 +106,48 @@ TOOL_REGISTRY = [
         description="Deterministic local retrieval over notes, rules, theses, and experiment conclusions.",
         route="/api/v1/copilot/query_knowledge_base",
     ),
+    CopilotToolSpec(
+        name="run_monitoring_checks",
+        description="Deterministic recurring monitoring over changes, rule violations, watchlist eligibility, and portfolio warnings.",
+        route="/api/v1/copilot/monitoring/run",
+    ),
+    CopilotToolSpec(
+        name="get_scorecard",
+        description="Deterministic local scorecard over journal activity, actions, blocked reasons, findings, and snapshot-change patterns.",
+        route="/api/v1/copilot/scorecard",
+    ),
+    CopilotToolSpec(
+        name="review_outcomes",
+        description="Deterministic local follow-up review over saved decisions, later findings, watchlist transitions, and recommendation consistency.",
+        route="/api/v1/copilot/outcomes",
+    ),
+    CopilotToolSpec(
+        name="get_comparative_validation",
+        description="Deterministic local cohort comparison over decisions, outcome states, later warnings, and watchlist transitions.",
+        route="/api/v1/copilot/comparative_validation",
+    ),
+    CopilotToolSpec(
+        name="run_shadow_portfolio",
+        description="Deterministic local shadow-paper review over saved decisions using first available local closes after the decision date and latest local marks in range.",
+        route="/api/v1/copilot/shadow_portfolio",
+    ),
+    CopilotToolSpec(
+        name="run_paper_portfolio_nav",
+        description="Deterministic local paper portfolio NAV path with explicit cash, allocation, drawdown, and benchmark assumptions over saved decisions.",
+        route="/api/v1/copilot/paper_portfolio_nav",
+    ),
+    CopilotToolSpec(
+        name="run_forward_validation_pilot",
+        description="Deterministic local weekly-style pilot review over journal activity, monitoring changes, and paper portfolio validation outputs.",
+        route="/api/v1/copilot/forward_validation_pilot",
+    ),
 ]
+USABLE_RECOMMENDATION_STATUSES = {
+    "eligible",
+    "eligible_with_cautions",
+    "eligible_new_position",
+    "eligible_add_to_existing",
+}
 
 
 def list_tools() -> list[CopilotToolSpec]:
@@ -102,7 +159,7 @@ def _normalize_tickers(tickers: list[str]) -> list[str]:
 
 
 def _make_config_key(top_n: int, defensive_mode: str) -> str:
-    return f"Top {top_n} · {'Cash' if defensive_mode == 'cash' else 'Defensive'}"
+    return f"Top {top_n} Ã‚Â· {'Cash' if defensive_mode == 'cash' else 'Defensive'}"
 
 
 def _parse_config_key(config_key: str) -> tuple[int, str]:
@@ -171,6 +228,144 @@ def _extract_top_n_values(query: str) -> list[int]:
 
 def _detect_chat_intent(query: str, session_state: CopilotChatSessionState | None) -> str:
     q = query.lower()
+    if any(
+        keyword in q
+        for keyword in [
+            "forward pilot",
+            "forward validation",
+            "pilot going",
+            "pilot window",
+            "pilot review",
+            "weekly review",
+            "last week",
+            "8 weeks",
+            "next week",
+            "accepted ideas behaving better than paper_only",
+            "accepted ideas behaving better than paper only",
+            "exit policy help or hurt",
+            "what should i review next week",
+            "biggest warning patterns in the current pilot",
+        ]
+    ):
+        return "forward_validation_pilot"
+    if any(
+        keyword in q
+        for keyword in [
+            "paper portfolio",
+            "paper nav",
+            "capital path",
+            "paper capital",
+            "paper portfolio nav",
+            "paper portfolio compare with spy",
+            "paper nav compare with spy",
+            "paper portfolio following accepted ideas",
+            "paper portfolio following",
+            "paper nav look like",
+            "cash would remain",
+            "cash remain under this simple paper rule",
+            "continuous paper portfolio",
+            "exit policy",
+            "positions exited early",
+            "exits were caused",
+            "remained active to the end",
+            "paper exit",
+            "hold policy",
+        ]
+    ):
+        return "paper_portfolio_nav"
+    if any(
+        keyword in q
+        for keyword in [
+            "shadow portfolio",
+            "paper mode",
+            "paper benchmark",
+            "shadow positions",
+            "shadow cohort",
+            "paper-only compare with accepted",
+            "paper only compare with accepted",
+            "compare with spy",
+            "supported by local price history",
+            "currently up or down",
+            "paper ideas",
+            "shadow review",
+            "paper_only compare with accepted",
+        ]
+    ):
+        return "shadow_portfolio"
+    if any(
+        keyword in q
+        for keyword in [
+            "accepted vs rejected",
+            "accepted ideas compare",
+            "compare with rejected",
+            "accepted vs watchlist",
+            "watchlist vs paper",
+            "watchlist vs paper_only",
+            "profile-blocked ideas",
+            "profile blocked ideas",
+            "which cohort",
+            "decision cohorts",
+            "cohort stays actionable",
+            "type of decisions deteriorate",
+            "deteriorate most often",
+            "operationally better than",
+            "compare cohorts",
+            "comparative validation",
+            "open new position vs add to existing",
+            "supported by knowledge vs unsupported",
+            "watchlist ideas often become actionable",
+            "usually less consistent later",
+        ]
+    ):
+        return "comparative_validation"
+    if any(
+        keyword in q
+        for keyword in [
+            "what happened after",
+            "accepted decisions",
+            "watchlist ideas later become actionable",
+            "watchlist later become actionable",
+            "recommendations stayed consistent",
+            "saved ideas later deteriorated",
+            "follow-up signals",
+            "outcome review",
+            "outcomes",
+        ]
+    ):
+        return "outcome_review"
+    if any(
+        keyword in q
+        for keyword in [
+            "scorecard",
+            "operationally",
+            "performing operationally",
+            "common reasons ideas get rejected",
+            "common reasons get rejected",
+            "eligible ideas did i actually act on",
+            "warning patterns",
+            "last 30 days",
+        ]
+    ):
+        return "scorecard_check"
+    if any(
+        keyword in q
+        for keyword in [
+            "what changed",
+            "changed since",
+            "last check",
+            "monitor",
+            "monitoring",
+            "new eligible",
+            "watchlist",
+            "violate my rules",
+            "violates my rules",
+            "violate profile",
+            "violates profile",
+            "less supported",
+            "became less supported",
+        ]
+    ):
+        return "monitoring_check"
     if any(keyword in q for keyword in ["why", "risks", "risk", "invalidate", "caveat", "recommend"]) and (
         session_state and (session_state.last_ranking or session_state.last_strategy_evaluation)
     ):
@@ -188,6 +383,90 @@ def _detect_chat_intent(query: str, session_state: CopilotChatSessionState | Non
     ):
         return "recommendation_explanation"
     return "unclear"
+
+
+def _extract_recent_days(query: str) -> int | None:
+    match = re.search(r"\blast\s+(\d+)\s+days?\b", query.lower())
+    if not match:
+        return None
+    return max(1, int(match.group(1)))
+
+
+def _extract_recent_weeks(query: str) -> int | None:
+    match = re.search(r"\blast\s+(\d+)\s+weeks?\b", query.lower())
+    if not match:
+        return None
+    return max(1, int(match.group(1)))
+
+
+def _extract_initial_capital(query: str, default: float = 10_000.0) -> float:
+    patterns = [
+        r"\binitial\s+capital\s+\$?([\d,]+(?:\.\d+)?)\b",
+        r"\bstarting\s+capital\s+\$?([\d,]+(?:\.\d+)?)\b",
+        r"\bstart(?:ing)?\s+with\s+\$?([\d,]+(?:\.\d+)?)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query.lower())
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return default
+
+
+def _wants_paper_exit_policy(query: str) -> bool:
+    q = query.lower()
+    return any(
+        keyword in q
+        for keyword in [
+            "exit policy",
+            "exit policies",
+            "positions exited early",
+            "exited early",
+            "deterioration vs replacement",
+            "remained active to the end",
+            "paper exit",
+            "hold policy",
+            "explicit exit",
+            "active vs exited",
+            "exit reason",
+        ]
+    )
+
+
+def _extract_action_taken_filter(query: str) -> str | None:
+    q = query.lower()
+    if "accepted" in q:
+        return "accepted"
+    if "watchlist" in q:
+        return "watchlist"
+    if "paper only" in q or "paper_only" in q:
+        return "paper_only"
+    if "rejected" in q:
+        return "rejected"
+    return None
+
+
+def _extract_shadow_cohort(query: str) -> str:
+    q = query.lower()
+    if "watchlist" in q and "actionable" in q:
+        return "watchlist_later_actionable"
+    if "accepted" in q and ("paper mode" in q or "shadow" in q or "spy" in q or "up or down" in q):
+        return "accepted"
+    if "paper only" in q or "paper_only" in q:
+        if "accepted" in q and "compare" not in q:
+            return "paper_only"
+        if "accepted" not in q:
+            return "paper_only"
+    if "accepted" in q and "paper" not in q:
+        return "accepted"
+    if "accepted" in q and ("paper only" in q or "paper_only" in q):
+        return "accepted_plus_paper_only"
+    return "accepted_plus_paper_only"
 
 
 def _default_single_dates() -> tuple[Any, Any]:
@@ -599,7 +878,8 @@ def _ranked_asset_policy_snapshot(
     asset: RankedAssetCopilot,
     *,
     profile,
-) -> tuple[dict[str, Any], KnowledgeBaseQueryResponse]:
+    portfolio,
+) -> tuple[dict[str, Any], KnowledgeBaseQueryResponse, dict[str, Any]]:
     kb = query_local_knowledge_base(
         KnowledgeBaseQueryRequest(
             query=_knowledge_query_for_recommendation(source="rank_assets", recommended_entity=asset.ticker),
@@ -614,7 +894,13 @@ def _ranked_asset_policy_snapshot(
         profile=profile,
         knowledge_matches=kb.matches,
     )
-    return policy, kb
+    portfolio_context = evaluate_portfolio_context(
+        recommended_entity_type="asset",
+        recommended_entity=asset.ticker,
+        portfolio=portfolio,
+        base_status=policy["recommendation_status"],
+    )
+    return policy, kb, portfolio_context
 
 
 def _candidate_alternatives_for_ranking(
@@ -622,19 +908,26 @@ def _candidate_alternatives_for_ranking(
     *,
     top_deterministic_result: str | None,
     profile,
+    portfolio,
 ) -> list[EligibleAlternative]:
     alternatives: list[EligibleAlternative] = []
     for asset in ranked_assets:
         if asset.ticker == top_deterministic_result:
             continue
-        policy, _ = _ranked_asset_policy_snapshot(asset, profile=profile)
-        if policy["recommendation_status"] not in {"eligible", "eligible_with_cautions"}:
+        policy, _, portfolio_context = _ranked_asset_policy_snapshot(
+            asset,
+            profile=profile,
+            portfolio=portfolio,
+        )
+        final_status = portfolio_context["recommendation_status"]
+        if final_status not in USABLE_RECOMMENDATION_STATUSES:
             continue
+        reason = portfolio_context["portfolio_decision_summary"] or policy["constraint_summary"]
         alternatives.append(
             EligibleAlternative(
                 entity=asset.ticker,
-                reason=policy["constraint_summary"],
-                recommendation_status=policy["recommendation_status"],
+                reason=reason,
+                recommendation_status=final_status,
             )
         )
     return alternatives
@@ -649,6 +942,7 @@ def _personalize_recommendation(
     ranked_assets: list[RankedAssetCopilot] | None = None,
 ) -> RecommendationPayload:
     profile, profile_warnings = load_investor_profile()
+    portfolio, portfolio_warnings = load_local_portfolio()
     kb = query_local_knowledge_base(KnowledgeBaseQueryRequest(query=knowledge_query, top_k=3))
     policy = evaluate_policy_context(
         recommended_entity_type=payload.recommended_entity_type,
@@ -658,29 +952,60 @@ def _personalize_recommendation(
         profile=profile,
         knowledge_matches=kb.matches,
     )
+    portfolio_context = evaluate_portfolio_context(
+        recommended_entity_type=payload.recommended_entity_type,
+        recommended_entity=payload.recommended_entity,
+        portfolio=portfolio,
+        base_status=policy["recommendation_status"],
+    )
     caveats = _merge_unique(payload.caveats, profile_warnings)
+    caveats = _merge_unique(caveats, portfolio_warnings)
     caveats = _merge_unique(caveats, policy["warnings"])
+    caveats = _merge_unique(caveats, portfolio_context["warnings"])
     caveats = _merge_unique(caveats, kb.warnings)
 
     top_deterministic_result = payload.top_deterministic_result or payload.recommended_entity
     recommended_entity = payload.recommended_entity
-    recommendation_status = policy["recommendation_status"]
+    recommendation_status = portfolio_context["recommendation_status"]
+    top_result_constraint_summary = (
+        portfolio_context["portfolio_decision_summary"]
+        if recommendation_status in {
+            "eligible_but_overconcentrated",
+            "rejected_by_portfolio_constraints",
+            "not_actionable_without_cash",
+            "redundant_exposure",
+        }
+        and portfolio_context["portfolio_decision_summary"]
+        else policy["constraint_summary"]
+    )
+    top_result_status = recommendation_status
     eligible_alternatives: list[EligibleAlternative] = []
+    active_policy = policy
+    active_kb = kb
+    active_portfolio = portfolio_context
 
     if payload.recommended_entity_type == "asset" and ranked_assets:
         eligible_alternatives = _candidate_alternatives_for_ranking(
             ranked_assets,
             top_deterministic_result=top_deterministic_result,
             profile=profile,
+            portfolio=portfolio,
         )
-        if recommendation_status in {"rejected_by_profile", "unsupported_by_knowledge"} and eligible_alternatives:
+        if recommendation_status not in USABLE_RECOMMENDATION_STATUSES and eligible_alternatives:
             recommended_entity = eligible_alternatives[0].entity
             recommendation_status = eligible_alternatives[0].recommendation_status
-            policy["constraint_summary"] = (
-                f"Top deterministic result {top_deterministic_result} is not usable. "
-                f"Best eligible alternative: {eligible_alternatives[0].entity}. {eligible_alternatives[0].reason}"
+            alternative_asset = next(
+                (asset for asset in ranked_assets if asset.ticker == recommended_entity),
+                None,
             )
-        elif recommendation_status in {"rejected_by_profile", "unsupported_by_knowledge"}:
+            if alternative_asset is not None:
+                active_policy, active_kb, active_portfolio = _ranked_asset_policy_snapshot(
+                    alternative_asset,
+                    profile=profile,
+                    portfolio=portfolio,
+                )
+                recommendation_status = active_portfolio["recommendation_status"]
+        elif recommendation_status not in USABLE_RECOMMENDATION_STATUSES:
             recommended_entity = None
 
     personalized = payload.model_copy(
@@ -689,13 +1014,23 @@ def _personalize_recommendation(
             "recommended_entity": recommended_entity,
             "top_deterministic_result": top_deterministic_result,
             "recommendation_status": recommendation_status,
-            "profile_constraints_applied": policy["constraints"],
-            "knowledge_sources_used": kb.matches,
-            "hard_conflicts": policy["hard_conflicts"],
-            "soft_conflicts": policy["soft_conflicts"],
-            "preference_matches": policy["preference_matches"],
-            "constraint_summary": policy["constraint_summary"],
+            "profile_constraints_applied": active_policy["constraints"],
+            "portfolio_context_applied": active_portfolio["portfolio_context_applied"],
+            "knowledge_sources_used": active_kb.matches,
+            "hard_conflicts": active_policy["hard_conflicts"],
+            "soft_conflicts": active_policy["soft_conflicts"],
+            "preference_matches": active_policy["preference_matches"],
+            "constraint_summary": active_policy["constraint_summary"],
+            "portfolio_decision_summary": active_portfolio["portfolio_decision_summary"],
+            "recommended_action_type": active_portfolio["recommended_action_type"],
+            "position_context": active_portfolio["position_context"],
+            "concentration_notes": active_portfolio["concentration_notes"],
             "eligible_alternatives": eligible_alternatives,
+            "supporting_metrics": {
+                **payload.supporting_metrics,
+                "top_result_recommendation_status": top_result_status,
+                "top_result_constraint_summary": top_result_constraint_summary,
+            },
         }
     )
     return _apply_recommendation_eligibility_wording(personalized)
@@ -714,9 +1049,28 @@ def _apply_recommendation_eligibility_wording(payload: RecommendationPayload) ->
         )
         why_preferred = [
             f"Deterministic evidence still places {top_entity} at the top of the current result set.",
-            f"Top-result constraint: {payload.hard_conflicts[0] if payload.hard_conflicts else payload.constraint_summary}",
+            "Top-result constraint: "
+            + str(
+                payload.supporting_metrics.get("top_result_constraint_summary")
+                or payload.constraint_summary
+            ),
             f"Best eligible alternative: {final_entity}.",
             f"Alternative status: {payload.recommendation_status.replace('_', ' ')}.",
+        ]
+    elif payload.recommendation_status in {
+        "rejected_by_portfolio_constraints",
+        "not_actionable_without_cash",
+        "redundant_exposure",
+        "eligible_but_overconcentrated",
+    }:
+        summary = (
+            f"Deterministically, {top_entity} is the current {deterministic_label}, "
+            f"but the current portfolio context makes it non-actionable: {payload.portfolio_decision_summary or payload.recommendation_status.replace('_', ' ')}"
+        )
+        why_preferred = [
+            f"Deterministic evidence still places {top_entity} at the top of the current result set.",
+            payload.portfolio_decision_summary or "Current portfolio context blocks or weakens actionability.",
+            f"Final recommendation status: {payload.recommendation_status.replace('_', ' ')}.",
         ]
     elif payload.recommendation_status == "rejected_by_profile":
         summary = (
@@ -746,6 +1100,22 @@ def _apply_recommendation_eligibility_wording(payload: RecommendationPayload) ->
             payload.constraint_summary or "The profile allows this result only with cautions.",
             "Final recommendation status: eligible with cautions.",
         ]
+    elif payload.recommendation_status == "eligible_add_to_existing":
+        chosen = final_entity or top_entity
+        summary = f"{chosen} is the current usable recommendation as an add to an existing position."
+        why_preferred = [
+            f"Deterministic evidence still favors {top_entity} within the current result set.",
+            payload.constraint_summary or "The result is eligible under the active profile.",
+            payload.portfolio_decision_summary or "This asset is already held, so the current action is an add-to-existing review.",
+        ]
+    elif payload.recommendation_status == "eligible_new_position":
+        chosen = final_entity or top_entity
+        summary = f"{chosen} is the current usable recommendation as a new position candidate."
+        why_preferred = [
+            f"Deterministic evidence still favors {top_entity} within the current result set.",
+            payload.constraint_summary or "The result is eligible under the active profile.",
+            payload.portfolio_decision_summary or "Cash is available and the asset is not already held.",
+        ]
     else:
         chosen = final_entity or top_entity
         summary = f"{chosen} is the current deterministic preference and is eligible for this profile."
@@ -767,6 +1137,10 @@ def _apply_recommendation_eligibility_wording(payload: RecommendationPayload) ->
         "soft_conflicts": payload.soft_conflicts,
         "preference_matches": payload.preference_matches,
         "top_deterministic_result": payload.top_deterministic_result,
+        "portfolio_decision_summary": payload.portfolio_decision_summary,
+        "recommended_action_type": payload.recommended_action_type,
+        "position_context": payload.position_context.model_dump() if payload.position_context else None,
+        "concentration_notes": payload.concentration_notes,
         "eligible_alternatives": [alternative.model_dump() for alternative in payload.eligible_alternatives],
     }
     return payload.model_copy(
@@ -781,10 +1155,22 @@ def _apply_recommendation_eligibility_wording(payload: RecommendationPayload) ->
 def _recommendation_headline(payload: RecommendationPayload, default: str) -> str:
     if payload.recommendation_status == "rejected_by_profile":
         return "Profile conflict: result not eligible"
+    if payload.recommendation_status == "rejected_by_portfolio_constraints":
+        return "Portfolio conflict: action blocked"
+    if payload.recommendation_status == "not_actionable_without_cash":
+        return "Portfolio blocked: no cash available"
+    if payload.recommendation_status == "redundant_exposure":
+        return "Portfolio warning: redundant exposure"
+    if payload.recommendation_status == "eligible_but_overconcentrated":
+        return "Portfolio warning: concentration too high"
     if payload.recommendation_status == "unsupported_by_knowledge":
         return "Knowledge support missing"
     if payload.recommendation_status == "eligible_with_cautions":
         return "Recommendation with cautions"
+    if payload.recommendation_status == "eligible_add_to_existing":
+        return "Add to existing position"
+    if payload.recommendation_status == "eligible_new_position":
+        return "New position candidate"
     return default
 
 
@@ -803,9 +1189,25 @@ def _recommendation_answer(payload: RecommendationPayload, default_headline: str
             if not payload.eligible_alternatives
             else "This is actionable only through the surfaced eligible alternative, not through the blocked top result."
         )
+    elif payload.recommendation_status in {"rejected_by_portfolio_constraints", "redundant_exposure", "eligible_but_overconcentrated"}:
+        final_summary = (
+            f"No portfolio-aware trade action is justified for {payload.recommended_entity or payload.top_deterministic_result or '-'}."
+        )
+        actionable = payload.portfolio_decision_summary or "The current portfolio makes this non-actionable."
+    elif payload.recommendation_status == "not_actionable_without_cash":
+        final_summary = (
+            f"No immediate trade action is justified for {payload.recommended_entity or payload.top_deterministic_result or '-'} because cash is unavailable."
+        )
+        actionable = payload.portfolio_decision_summary or "This is not actionable without available cash."
     elif payload.recommendation_status == "unsupported_by_knowledge":
         final_summary = f"No justified personalized recommendation is available yet for {payload.top_deterministic_result or payload.recommended_entity or 'this result'}."
         actionable = "This is not actionable yet because local knowledge support is missing."
+    elif payload.recommendation_status == "eligible_add_to_existing":
+        final_summary = f"Portfolio-aware action: add to the existing {payload.recommended_entity or payload.top_deterministic_result or '-'} position."
+        actionable = payload.portfolio_decision_summary or "This is actionable as an add-to-existing-position review."
+    elif payload.recommendation_status == "eligible_new_position":
+        final_summary = f"Portfolio-aware action: open a new position in {payload.recommended_entity or payload.top_deterministic_result or '-'}."
+        actionable = payload.portfolio_decision_summary or "This is actionable as a new-position candidate."
     elif payload.recommendation_status == "eligible_with_cautions":
         final_summary = f"Usable recommendation: {payload.recommended_entity or payload.top_deterministic_result or '-'}."
         actionable = "This is actionable, but only with the cautions listed in the profile decision."
@@ -833,6 +1235,7 @@ def _recommendation_answer(payload: RecommendationPayload, default_headline: str
             f"Top deterministic result: {payload.top_deterministic_result or payload.recommended_entity or '-'}."
         ),
         profile_decision_summary=payload.constraint_summary or "No profile decision summary available.",
+        portfolio_decision_summary=payload.portfolio_decision_summary or "No portfolio decision summary available.",
         final_recommendation_summary=final_summary,
         why_this_is_or_is_not_actionable=actionable,
         confidence_notes=confidence_notes,
@@ -1232,7 +1635,7 @@ async def run_strategy_evaluation_tool(
                 )
                 continue
 
-            winner_top_n = int(winner_key.split(" · ")[0].replace("Top ", ""))
+            winner_top_n = int(winner_key.split(" Ã‚Â· ")[0].replace("Top ", ""))
             winner_mode = "cash" if winner_key.endswith("Cash") else "defensive_asset"
             try:
                 rotation_result, benchmark_result = run_single_rotation(
@@ -1553,6 +1956,472 @@ async def copilot_chat_tool(
     supporting_data: dict[str, Any] = {}
     next_actions: list[str] = []
 
+    if detected_intent == "shadow_portfolio":
+        date_from, date_to = _extract_dates(request.user_query)
+        recent_days = _extract_recent_days(request.user_query)
+        if recent_days is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=recent_days - 1)).date()
+        q = request.user_query.lower()
+        compare_paper_vs_accepted = (
+            ("paper only compare with accepted" in q)
+            or ("paper-only compare with accepted" in q)
+            or ("paper_only compare with accepted" in q)
+            or ("compare accepted with paper" in q)
+        )
+        if compare_paper_vs_accepted:
+            accepted_shadow = await shadow_portfolio_service.build_shadow_portfolio(
+                session,
+                ShadowPortfolioRequest(
+                    cohort_definition="accepted",
+                    date_from=str(date_from) if date_from is not None else None,
+                    date_to=str(date_to) if date_to is not None else None,
+                ),
+            )
+            paper_shadow = await shadow_portfolio_service.build_shadow_portfolio(
+                session,
+                ShadowPortfolioRequest(
+                    cohort_definition="paper_only",
+                    date_from=str(date_from) if date_from is not None else None,
+                    date_to=str(date_to) if date_to is not None else None,
+                ),
+            )
+            tools_used.append("run_shadow_portfolio")
+            supporting_data["shadow_portfolio"] = {
+                "accepted": accepted_shadow.model_dump(mode="json"),
+                "paper_only": paper_shadow.model_dump(mode="json"),
+            }
+            warnings.extend(accepted_shadow.warnings[:3])
+            for item in paper_shadow.warnings[:3]:
+                if item not in warnings:
+                    warnings.append(item)
+            answer = CopilotChatAnswer(
+                headline="Shadow portfolio comparison ready",
+                summary=(
+                    f"Compared accepted versus paper-only shadow cohorts for "
+                    f"{accepted_shadow.date_range.label} using only local daily closes."
+                ),
+                bullets=[
+                    (
+                        f"Accepted equal-weight paper return: {accepted_shadow.paper_summary.equal_weight_simple_return_pct:.2f}%."
+                        if accepted_shadow.paper_summary.equal_weight_simple_return_pct is not None
+                        else "Accepted decisions did not have enough supported local price history for a paper return."
+                    ),
+                    (
+                        f"Paper-only equal-weight paper return: {paper_shadow.paper_summary.equal_weight_simple_return_pct:.2f}%."
+                        if paper_shadow.paper_summary.equal_weight_simple_return_pct is not None
+                        else "Paper-only decisions did not have enough supported local price history for a paper return."
+                    ),
+                    f"Supported positions: accepted {accepted_shadow.supported_positions}, paper-only {paper_shadow.supported_positions}.",
+                    "This compares paper marks only, not execution-adjusted or broker-realized outcomes.",
+                ],
+                deterministic_evidence_summary="Shadow portfolio marks use the first local daily close on or after each decision date and the latest local daily close in range.",
+                final_recommendation_summary="This is a cautious paper benchmark comparison, not broker-grade attribution.",
+                why_this_is_or_is_not_actionable="Use this to compare how accepted and paper-only ideas currently mark under the same simple local assumptions.",
+                confidence_notes=[
+                    "Unsupported positions are excluded from simple-return summaries instead of being guessed."
+                ],
+            )
+        else:
+            shadow = await shadow_portfolio_service.build_shadow_portfolio(
+                session,
+                ShadowPortfolioRequest(
+                    cohort_definition=_extract_shadow_cohort(request.user_query),
+                    date_from=str(date_from) if date_from is not None else None,
+                    date_to=str(date_to) if date_to is not None else None,
+                ),
+            )
+            tools_used.append("run_shadow_portfolio")
+            supporting_data["shadow_portfolio"] = shadow.model_dump(mode="json")
+            warnings.extend(shadow.warnings[:5])
+            top_positive = next(
+                (
+                    item
+                    for item in sorted(
+                        shadow.paper_positions,
+                        key=lambda position: (
+                            -(
+                                position.simple_return_pct
+                                if position.simple_return_pct is not None
+                                else float("-inf")
+                            ),
+                            position.entity or "",
+                        ),
+                    )
+                    if item.supported and item.simple_return_pct is not None
+                ),
+                None,
+            )
+            answer = CopilotChatAnswer(
+                headline="Shadow portfolio ready",
+                summary=(
+                    f"Built a {shadow.cohort_definition.label.lower()} shadow cohort for "
+                    f"{shadow.date_range.label} using only local stored decisions and local price history."
+                ),
+                bullets=[
+                    f"Supported positions: {shadow.supported_positions}; unsupported positions: {shadow.unsupported_positions}.",
+                    (
+                        f"Equal-weight paper return: {shadow.paper_summary.equal_weight_simple_return_pct:.2f}%."
+                        if shadow.paper_summary.equal_weight_simple_return_pct is not None
+                        else "No supported paper return could be computed from the available local price history."
+                    ),
+                    (
+                        f"Benchmark comparison: {shadow.comparison_summary.interpretation}"
+                        if shadow.comparison_summary.benchmark_comparison_supported
+                        else "Benchmark comparison was not supported by the available local data."
+                    ),
+                    (
+                        f"Strongest currently supported paper idea: {top_positive.entity} at {top_positive.simple_return_pct:.2f}%."
+                        if top_positive is not None
+                        else "No supported paper positions were currently up or down from local mark data."
+                    ),
+                ],
+                deterministic_evidence_summary="Paper entry uses the first local daily close on or after the decision date, and paper marks use the latest local daily close in range.",
+                final_recommendation_summary="This is a local paper benchmark only. It does not model fills, slippage, fees, or broker execution.",
+                why_this_is_or_is_not_actionable="Use this to review which saved ideas are locally supportable in paper mode and how they currently mark under simple equal-weight assumptions.",
+                confidence_notes=[
+                    "Simple returns are only shown for positions with enough local price history to support both the entry and the latest mark."
+                ],
+            )
+        next_actions = [
+            "Run the shadow portfolio with a tighter date range or a different cohort if you want a narrower paper review.",
+            "Inspect unsupported positions when local price history is missing instead of treating them as real paper outcomes.",
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=None,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
+    if detected_intent == "comparative_validation":
+        date_from, date_to = _extract_dates(request.user_query)
+        recent_days = _extract_recent_days(request.user_query)
+        if recent_days is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=recent_days - 1)).date()
+        comparison = comparative_validation_service.generate_comparative_validation(
+            ComparativeValidationRequest(
+                date_from=str(date_from) if date_from is not None else None,
+                date_to=str(date_to) if date_to is not None else None,
+            )
+        )
+        tools_used.append("get_comparative_validation")
+        supporting_data["comparative_validation"] = comparison.model_dump(mode="json")
+        warnings.extend(comparison.warnings[:5])
+        actionable_leader = next(
+            (
+                item
+                for item in sorted(
+                    comparison.cohort_summaries,
+                    key=lambda cohort: (-(cohort.proportion_still_actionable or 0.0), -cohort.total_decisions, cohort.label),
+                )
+                if item.total_decisions > 0 and item.proportion_still_actionable is not None
+            ),
+            None,
+        )
+        deterioration_leader = next(
+            (
+                item
+                for item in sorted(
+                    comparison.cohort_summaries,
+                    key=lambda cohort: (-(cohort.proportion_later_deteriorated or 0.0), -cohort.total_decisions, cohort.label),
+                )
+                if item.total_decisions > 0 and item.proportion_later_deteriorated is not None
+            ),
+            None,
+        )
+        accepted_vs_rejected = next(
+            (
+                item
+                for item in comparison.consistency_summary
+                if item.comparison_key == "accepted_vs_rejected"
+            ),
+            None,
+        )
+        answer = CopilotChatAnswer(
+            headline="Comparative validation ready",
+            summary=(
+                f"Compared {len(comparison.comparison_groups)} local decision cohorts for "
+                f"{comparison.date_range.label} using only journal, findings, snapshots, and outcome-review states."
+            ),
+            bullets=[
+                (
+                    f"Accepted vs rejected consistency: {accepted_vs_rejected.interpretation}"
+                    if accepted_vs_rejected is not None
+                    else "Accepted versus rejected consistency could not be compared from the selected local sample."
+                ),
+                (
+                    f"Most actionable cohort later: {actionable_leader.label} ({actionable_leader.proportion_still_actionable:.0%})."
+                    if actionable_leader is not None
+                    else "No cohort had enough later evidence to rank by continued actionability."
+                ),
+                (
+                    f"Most frequent later deterioration: {deterioration_leader.label} ({deterioration_leader.proportion_later_deteriorated:.0%})."
+                    if deterioration_leader is not None
+                    else "No cohort had enough later evidence to rank by deterioration frequency."
+                ),
+                comparison.notable_patterns[0] if comparison.notable_patterns else "No strong comparative patterns were available from the selected range.",
+            ],
+            deterministic_evidence_summary="Comparative validation aggregates local outcome-review states that were themselves derived only from journal records, later findings, and later monitoring snapshots.",
+            final_recommendation_summary="This is a cautious process benchmark, not a return or PnL benchmark.",
+            why_this_is_or_is_not_actionable="Use this to compare cohorts in operational terms such as consistency, later deterioration, and continued actionability before changing your decision process.",
+            confidence_notes=[
+                "Comparisons describe local operational follow-through only. They do not claim financial outperformance."
+            ],
+        )
+        next_actions = [
+            "Run comparative validation with a tighter date range if you want a narrower cohort sample.",
+            "Inspect the cohort summaries if one decision type appears to deteriorate or lose actionability more often.",
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=None,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
+    if detected_intent == "outcome_review":
+        date_from, date_to = _extract_dates(request.user_query)
+        recent_days = _extract_recent_days(request.user_query)
+        if recent_days is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=recent_days - 1)).date()
+        outcome_review = outcome_service.review_outcomes(
+            OutcomeReviewRequest(
+                date_from=str(date_from) if date_from is not None else None,
+                date_to=str(date_to) if date_to is not None else None,
+                action_taken=_extract_action_taken_filter(request.user_query),
+            )
+        )
+        tools_used.append("review_outcomes")
+        supporting_data["outcomes"] = outcome_review.model_dump(mode="json")
+        warnings.extend(outcome_review.warnings[:5])
+        latest_entry = outcome_review.entries[0] if outcome_review.entries else None
+        answer = CopilotChatAnswer(
+            headline="Outcome review ready",
+            summary=(
+                f"Reviewed {outcome_review.summary.total_decisions_reviewed} saved decision(s) for "
+                f"{outcome_review.date_range.label}."
+            ),
+            bullets=[
+                f"Accepted decisions reviewed: {outcome_review.summary.accepted_decisions}.",
+                f"Decisions with later findings: {outcome_review.summary.decisions_with_later_findings}.",
+                f"Watchlist or paper-only later actionable: {outcome_review.summary.watchlist_or_paper_only_later_actionable}.",
+                (
+                    f"Most recent follow-up state: {latest_entry.entity or 'unidentified idea'} is {latest_entry.current_relevance_status}."
+                    if latest_entry is not None
+                    else "No saved decisions were available for outcome review in the selected range."
+                ),
+            ],
+            deterministic_evidence_summary="Outcome review uses only local journal timestamps, later findings, and later monitoring snapshots.",
+            final_recommendation_summary="This is a cautious follow-up state review, not a financial-performance attribution report.",
+            why_this_is_or_is_not_actionable="Use this to see whether saved ideas stayed relevant, triggered later warnings, or became actionable after watchlist decisions.",
+            confidence_notes=[
+                "No PnL, fills, returns, or broker execution outcomes are inferred in this review."
+            ],
+        )
+        next_actions = [
+            "Run the outcomes endpoint with a tighter date range or action filter if you want a narrower follow-up review.",
+            "Review the journal entry and later findings for any idea that shows deterioration or inconsistency.",
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=None,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
+    if detected_intent == "scorecard_check":
+        date_from, date_to = _extract_dates(request.user_query)
+        recent_days = _extract_recent_days(request.user_query)
+        if recent_days is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=recent_days - 1)).date()
+        scorecard = scorecard_service.generate_scorecard(
+            ScorecardRequest(
+                date_from=str(date_from) if date_from is not None else None,
+                date_to=str(date_to) if date_to is not None else None,
+            )
+        )
+        tools_used.append("get_scorecard")
+        supporting_data["scorecard"] = scorecard.model_dump(mode="json")
+        warnings.extend(scorecard.warnings[:5])
+        top_reason = (
+            scorecard.constraint_summary.top_blocked_or_rejected_reasons[0]
+            if scorecard.constraint_summary.top_blocked_or_rejected_reasons
+            else None
+        )
+        top_finding = (
+            scorecard.findings_summary.findings_by_finding_type[0]
+            if scorecard.findings_summary.findings_by_finding_type
+            else None
+        )
+        answer = CopilotChatAnswer(
+            headline="Operational scorecard ready",
+            summary=(
+                f"Reviewed {scorecard.journal_summary.total_journal_decisions} journal decision(s) and "
+                f"{scorecard.findings_summary.total_findings} monitoring finding(s) for {scorecard.date_range.label}."
+            ),
+            bullets=[
+                f"Eligible ideas actually acted on: {scorecard.recommendation_summary.eligible_ideas_acted_on}.",
+                (
+                    f"Most common blocked reason: {top_reason.item} ({top_reason.count})."
+                    if top_reason is not None
+                    else "No blocked or rejected reason distribution was available from the stored fields."
+                ),
+                (
+                    f"Most frequent finding pattern: {top_finding.item} ({top_finding.count})."
+                    if top_finding is not None
+                    else "No findings were available in the selected range."
+                ),
+                (
+                    f"Watchlist or paper-only items later actionable: {scorecard.monitoring_summary.watchlist_or_paper_only_later_actionable_count}."
+                    if scorecard.monitoring_summary.watchlist_or_paper_only_later_actionable_count is not None
+                    else "Watchlist to actionable transitions could not be computed reliably from the stored data."
+                ),
+            ],
+            deterministic_evidence_summary="Scorecard metrics are derived only from local journal, findings, and snapshot history.",
+            final_recommendation_summary="This is an operational validation summary, not a financial performance attribution report.",
+            why_this_is_or_is_not_actionable="Use this to review decision discipline, blocked patterns, and monitoring noise before changing any process.",
+            confidence_notes=[
+                "No returns, PnL, or outcome attribution is inferred unless explicitly present in local stored data."
+            ],
+        )
+        next_actions = [
+            "Run the scorecard endpoint with a tighter date range if you want a narrower operational review.",
+            "Review journal and findings details if a repeated blocked reason or warning pattern stands out.",
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=None,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
+    if detected_intent == "monitoring_check":
+        monitoring = await monitoring_service.run_monitoring_checks(
+            session,
+            MonitoringRunRequest(save_snapshot=True),
+        )
+        tools_used.append("run_monitoring_checks")
+        supporting_data["monitoring"] = monitoring.model_dump(mode="json")
+        warnings.extend(monitoring.warnings)
+        top_finding = monitoring.findings[0] if monitoring.findings else None
+        bullets = [
+            monitoring.summary,
+            (
+                f"Current best eligible asset: {monitoring.current_snapshot.best_eligible_asset} "
+                f"({monitoring.current_snapshot.best_eligible_status})."
+            )
+            if monitoring.current_snapshot.best_eligible_asset
+            else "No currently eligible asset was surfaced in this monitoring run.",
+            (
+                "New warnings since last snapshot: "
+                + ", ".join(monitoring.comparison.new_key_warnings[:3])
+            )
+            if monitoring.comparison.new_key_warnings
+            else "No new key warnings were added versus the last snapshot.",
+        ]
+        if top_finding is not None:
+            bullets.append(f"Top finding: {top_finding.headline}.")
+        answer = CopilotChatAnswer(
+            headline="Monitoring check complete",
+            summary=monitoring.summary,
+            bullets=bullets,
+            deterministic_evidence_summary=(
+                f"Top deterministic result: {monitoring.current_snapshot.top_deterministic_result or 'none'}."
+            ),
+            final_recommendation_summary=(
+                f"Current best eligible asset: {monitoring.current_snapshot.best_eligible_asset}."
+                if monitoring.current_snapshot.best_eligible_asset
+                else "No current eligible asset is supported yet."
+            ),
+            why_this_is_or_is_not_actionable=(
+                top_finding.why_it_matters
+                if top_finding is not None
+                else "No new monitoring findings were generated in this run."
+            ),
+            confidence_notes=[
+                "Monitoring is deterministic and based on the current local profile, knowledge files, portfolio file, journal watchlist entries, and local market data."
+            ],
+        )
+        next_actions = [
+            "Open the findings list to review severity and suggested next actions.",
+            "Ask for a ranking or recommendation explanation if you want the current leader unpacked in detail.",
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=monitoring.current_snapshot.best_eligible_status,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=monitoring.current_snapshot.best_eligible_action,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
     if detected_intent == "market_snapshot":
         tickers = await _resolve_query_tickers(session, request.user_query)
         date_from, date_to = _extract_dates(request.user_query)
@@ -1590,7 +2459,11 @@ async def copilot_chat_tool(
             supporting_data=supporting_data,
             recommendation_status=None,
             profile_constraints_applied=[],
+            portfolio_context_applied=[],
             knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
             eligible_alternatives=[],
             warnings=warnings,
             next_actions=next_actions,
@@ -1620,6 +2493,9 @@ async def copilot_chat_tool(
         profile, _ = load_investor_profile()
         if profile is not None:
             supporting_data["active_profile"] = profile.model_dump(mode="json")
+        portfolio, _ = load_local_portfolio()
+        if portfolio is not None:
+            supporting_data["active_portfolio"] = portfolio.model_dump(mode="json")
         warnings.extend(explanation.caveats)
         answer = _recommendation_answer(explanation, "Asset ranking and recommendation ready")
         if explanation.recommendation_status == "rejected_by_profile":
@@ -1653,8 +2529,209 @@ async def copilot_chat_tool(
             supporting_data=supporting_data,
             recommendation_status=explanation.recommendation_status,
             profile_constraints_applied=explanation.profile_constraints_applied,
+            portfolio_context_applied=explanation.portfolio_context_applied,
             knowledge_sources_used=explanation.knowledge_sources_used,
+            recommended_action_type=explanation.recommended_action_type,
+            position_context=explanation.position_context,
+            concentration_notes=explanation.concentration_notes,
             eligible_alternatives=explanation.eligible_alternatives,
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
+    if detected_intent == "paper_portfolio_nav":
+        date_from, date_to = _extract_dates(request.user_query)
+        recent_days = _extract_recent_days(request.user_query)
+        if recent_days is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=recent_days - 1)).date()
+        apply_exit_policy = _wants_paper_exit_policy(request.user_query)
+        paper_nav = await paper_portfolio_nav_service.build_paper_portfolio_nav(
+            session,
+            PaperPortfolioNavRequest(
+                cohort_definition=_extract_shadow_cohort(request.user_query),
+                date_from=str(date_from) if date_from is not None else None,
+                date_to=str(date_to) if date_to is not None else None,
+                initial_capital=_extract_initial_capital(request.user_query),
+                apply_exit_policy=apply_exit_policy,
+            ),
+        )
+        tools_used.append("run_paper_portfolio_nav")
+        supporting_data["paper_portfolio_nav"] = paper_nav.model_dump(mode="json")
+        warnings.extend(paper_nav.warnings[:5])
+        top_position = next(
+            (
+                item
+                for item in sorted(
+                    paper_nav.position_summaries,
+                    key=lambda position: (
+                        -(
+                            position.simple_return_pct
+                            if position.simple_return_pct is not None
+                            else float("-inf")
+                        ),
+                        position.entity or "",
+                    ),
+                )
+                if item.supported and item.simple_return_pct is not None
+            ),
+            None,
+        )
+        paper_nav_bullets = [
+            f"Initial capital {paper_nav.initial_capital:.2f}; ending value {paper_nav.ending_value:.2f}; cash remaining {paper_nav.cash_remaining:.2f}.",
+            f"Supported positions: {paper_nav.nav_summary.supported_positions}; unsupported or inactive: {paper_nav.nav_summary.unsupported_positions}.",
+            (
+                f"Active positions at the end: {paper_nav.active_positions_count}; exited early: {paper_nav.exited_positions_count}; unsupported exits: {paper_nav.unsupported_exit_count}."
+                if apply_exit_policy
+                else "Positions were held to the selected window end because no exit policy was applied."
+            ),
+            (
+                f"Portfolio simple return: {paper_nav.nav_summary.total_portfolio_simple_return_pct:.2f}%."
+                if paper_nav.nav_summary.total_portfolio_simple_return_pct is not None
+                else "No supported paper NAV return could be computed from the available local history."
+            ),
+            (
+                f"Benchmark comparison: {paper_nav.comparison_summary.interpretation}"
+                if paper_nav.comparison_summary.benchmark_comparison_supported
+                else "Benchmark comparison was not supported by the available local data."
+            ),
+            (
+                f"Exit-policy effect versus hold-to-window-end: {paper_nav.comparison_summary.exit_policy_ending_value_difference:.2f} in ending value."
+                if apply_exit_policy and paper_nav.comparison_summary.exit_policy_ending_value_difference is not None
+                else (
+                    f"Strongest currently supported paper position: {top_position.entity} at {top_position.simple_return_pct:.2f}%."
+                    if top_position is not None
+                    else "No supported paper positions had enough local marks to rank current paper outcomes."
+                )
+            ),
+        ]
+        if apply_exit_policy and paper_nav.exit_reason_distribution:
+            paper_nav_bullets.append(
+                f"Exit reasons observed: {', '.join(f'{item.item}={item.count}' for item in paper_nav.exit_reason_distribution[:3])}."
+            )
+        answer = CopilotChatAnswer(
+            headline="Paper portfolio NAV ready",
+            summary=(
+                f"Built a cautious {paper_nav.cohort_definition.label.lower()} paper capital path for "
+                f"{paper_nav.date_range.label} using only saved decisions and local price history."
+            ),
+            bullets=paper_nav_bullets,
+            deterministic_evidence_summary="Entries open at the first local daily close on or after each decision date, cash is debited only when positions open, and NAV marks use the latest local daily close on or before each valuation date.",
+            final_recommendation_summary=(
+                "This is a cautious local paper portfolio path only. It does not model fills, slippage, fees, taxes, or broker execution."
+                if not apply_exit_policy
+                else "This is a cautious local paper portfolio path with explicit exit-policy rules. It still does not model fills, slippage, fees, taxes, or broker execution."
+            ),
+            why_this_is_or_is_not_actionable=(
+                "Use this to review how a simple paper capital path would have evolved under explicit local assumptions, including remaining cash and unsupported positions."
+                if not apply_exit_policy
+                else "Use this to review which paper positions would have remained active, which would have exited early, and how cash would have recycled under explicit local exit rules."
+            ),
+            confidence_notes=[
+                "Unsupported positions are surfaced explicitly instead of being guessed into the NAV path.",
+                "Duplicate concurrent entries into the same entity are skipped unless an earlier supported replacement exit clears exposure first.",
+            ],
+        )
+        next_actions = [
+            "Run the paper portfolio over a tighter date range or a different cohort if you want a narrower capital-path review.",
+            (
+                "Inspect unsupported or duplicate entries before treating the paper NAV as a continuous benchmark."
+                if not apply_exit_policy
+                else "Inspect unsupported exits and replacement assumptions before treating the exit-policy NAV as a disciplined paper benchmark."
+            ),
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=None,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
+            warnings=warnings,
+            next_actions=next_actions,
+            session_state=updated_state,
+        )
+
+    if detected_intent == "forward_validation_pilot":
+        date_from, date_to = _extract_dates(request.user_query)
+        recent_days = _extract_recent_days(request.user_query)
+        recent_weeks = _extract_recent_weeks(request.user_query)
+        if "last week" in request.user_query.lower() and recent_days is None and recent_weeks is None and date_from is None and date_to is None:
+            recent_days = 7
+        if recent_weeks is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=(recent_weeks * 7) - 1)).date()
+        elif recent_days is not None and date_from is None and date_to is None:
+            date_to = datetime.now(UTC).date()
+            date_from = (pd.Timestamp(date_to) - pd.Timedelta(days=recent_days - 1)).date()
+
+        pilot = await forward_validation_service.generate_forward_validation_pilot(
+            session,
+            ForwardValidationPilotRequest(
+                date_from=str(date_from) if date_from is not None else None,
+                date_to=str(date_to) if date_to is not None else None,
+                initial_capital=_extract_initial_capital(request.user_query),
+            ),
+        )
+        tools_used.append("run_forward_validation_pilot")
+        supporting_data["forward_validation_pilot"] = pilot.model_dump(mode="json")
+        warnings.extend(pilot.warnings[:6])
+        answer = CopilotChatAnswer(
+            headline="Forward validation pilot ready",
+            summary=(
+                f"Reviewed the local forward pilot for {pilot.pilot_window.label} "
+                "using saved decisions, monitoring data, and supported paper portfolio outputs."
+            ),
+            bullets=[
+                (
+                    f"Decisions in period: {pilot.review_protocol.total_decisions_in_period}; "
+                    f"accepted {pilot.review_protocol.accepted_count}; paper-only {pilot.review_protocol.paper_only_count}; "
+                    f"findings generated {pilot.review_protocol.findings_generated}."
+                ),
+                pilot.cohort_comparison_summary.accepted_vs_paper_only.interpretation,
+                pilot.cohort_comparison_summary.hold_only_vs_exit_policy.interpretation,
+                pilot.benchmark_summary.interpretation,
+                (
+                    f"Next review focus: {pilot.next_review_actions[0]}"
+                    if pilot.next_review_actions
+                    else "Next review focus: rerun the same weekly pilot review to keep the local validation trail current."
+                ),
+            ],
+            deterministic_evidence_summary="This pilot review reuses local journal records, monitoring findings and snapshots, and supported paper portfolio outputs over the same real-world window.",
+            final_recommendation_summary="Interpretations are operational and directional only. They do not claim real profitability, alpha, or broker-grade execution outcomes.",
+            why_this_is_or_is_not_actionable="Use this review to decide what to inspect next week, which cohorts still look operationally consistent, and whether the paper exit policy helped or hurt in this local sample.",
+            confidence_notes=[
+                "Accepted versus paper-only and hold-only versus exit-policy comparisons are only shown as supported when the local sample and paper history are sufficient.",
+                "Unsupported or weak pilot metrics are kept explicit in warnings and missing-data notes instead of being guessed.",
+            ],
+        )
+        next_actions = pilot.next_review_actions[:3] or [
+            "Run the forward validation pilot again next week to extend the local audit trail."
+        ]
+        updated_state = session_state.model_copy(update={"last_intent": detected_intent})
+        return CopilotChatResponse(
+            user_query=request.user_query,
+            detected_intent=detected_intent,
+            tools_used=tools_used,
+            answer=answer,
+            supporting_data=supporting_data,
+            recommendation_status=None,
+            profile_constraints_applied=[],
+            portfolio_context_applied=[],
+            knowledge_sources_used=[],
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
+            eligible_alternatives=[],
             warnings=warnings,
             next_actions=next_actions,
             session_state=updated_state,
@@ -1731,6 +2808,9 @@ async def copilot_chat_tool(
             profile, _ = load_investor_profile()
             if profile is not None:
                 supporting_data["active_profile"] = profile.model_dump(mode="json")
+            portfolio, _ = load_local_portfolio()
+            if portfolio is not None:
+                supporting_data["active_portfolio"] = portfolio.model_dump(mode="json")
             warnings.extend(explanation.caveats)
             answer = _recommendation_answer(explanation, "Strategy evaluation and explanation ready")
             next_actions = [
@@ -1745,7 +2825,13 @@ async def copilot_chat_tool(
                 }
             )
             profile_constraints_applied = explanation.profile_constraints_applied
+            portfolio_context_applied = explanation.portfolio_context_applied
             knowledge_sources_used = explanation.knowledge_sources_used
+            recommendation_status = explanation.recommendation_status
+            recommended_action_type = explanation.recommended_action_type
+            position_context = explanation.position_context
+            concentration_notes = explanation.concentration_notes
+            eligible_alternatives = explanation.eligible_alternatives
         else:
             answer = CopilotChatAnswer(
                 headline="Strategy evaluation complete",
@@ -1768,8 +2854,12 @@ async def copilot_chat_tool(
                 }
             )
             profile_constraints_applied = []
+            portfolio_context_applied = []
             knowledge_sources_used = []
             recommendation_status = None
+            recommended_action_type = None
+            position_context = None
+            concentration_notes = []
             eligible_alternatives = []
 
         return CopilotChatResponse(
@@ -1782,7 +2872,19 @@ async def copilot_chat_tool(
                 explanation.recommendation_status if any(keyword in q for keyword in ["why", "recommend", "risk", "risks"]) else recommendation_status
             ),
             profile_constraints_applied=profile_constraints_applied,
+            portfolio_context_applied=(
+                explanation.portfolio_context_applied if any(keyword in q for keyword in ["why", "recommend", "risk", "risks"]) else portfolio_context_applied
+            ),
             knowledge_sources_used=knowledge_sources_used,
+            recommended_action_type=(
+                explanation.recommended_action_type if any(keyword in q for keyword in ["why", "recommend", "risk", "risks"]) else recommended_action_type
+            ),
+            position_context=(
+                explanation.position_context if any(keyword in q for keyword in ["why", "recommend", "risk", "risks"]) else position_context
+            ),
+            concentration_notes=(
+                explanation.concentration_notes if any(keyword in q for keyword in ["why", "recommend", "risk", "risks"]) else concentration_notes
+            ),
             eligible_alternatives=(
                 explanation.eligible_alternatives if any(keyword in q for keyword in ["why", "recommend", "risk", "risks"]) else eligible_alternatives
             ),
@@ -1804,6 +2906,9 @@ async def copilot_chat_tool(
             profile, _ = load_investor_profile()
             if profile is not None:
                 supporting_data["active_profile"] = profile.model_dump(mode="json")
+            portfolio, _ = load_local_portfolio()
+            if portfolio is not None:
+                supporting_data["active_portfolio"] = portfolio.model_dump(mode="json")
             answer = _recommendation_answer(explanation, "Recommendation explanation ready")
             next_actions = [
                 "Ask about risks or invalidation to focus on downside conditions.",
@@ -1813,8 +2918,12 @@ async def copilot_chat_tool(
                 update={"last_intent": detected_intent, "last_recommendation": explanation}
             )
             profile_constraints_applied = explanation.profile_constraints_applied
+            portfolio_context_applied = explanation.portfolio_context_applied
             knowledge_sources_used = explanation.knowledge_sources_used
             recommendation_status = explanation.recommendation_status
+            recommended_action_type = explanation.recommended_action_type
+            position_context = explanation.position_context
+            concentration_notes = explanation.concentration_notes
             eligible_alternatives = explanation.eligible_alternatives
         elif session_state.last_ranking is not None:
             explanation = explain_recommendation_tool(
@@ -1828,6 +2937,9 @@ async def copilot_chat_tool(
             profile, _ = load_investor_profile()
             if profile is not None:
                 supporting_data["active_profile"] = profile.model_dump(mode="json")
+            portfolio, _ = load_local_portfolio()
+            if portfolio is not None:
+                supporting_data["active_portfolio"] = portfolio.model_dump(mode="json")
             answer = _recommendation_answer(explanation, "Ranking explanation ready")
             next_actions = [
                 "Ask for a strategy evaluation if you want the ranked universe tested.",
@@ -1837,8 +2949,12 @@ async def copilot_chat_tool(
                 update={"last_intent": detected_intent, "last_recommendation": explanation}
             )
             profile_constraints_applied = explanation.profile_constraints_applied
+            portfolio_context_applied = explanation.portfolio_context_applied
             knowledge_sources_used = explanation.knowledge_sources_used
             recommendation_status = explanation.recommendation_status
+            recommended_action_type = explanation.recommended_action_type
+            position_context = explanation.position_context
+            concentration_notes = explanation.concentration_notes
             eligible_alternatives = explanation.eligible_alternatives
         else:
             answer = CopilotChatAnswer(
@@ -1855,8 +2971,12 @@ async def copilot_chat_tool(
             ]
             updated_state = session_state.model_copy(update={"last_intent": "unclear"})
             profile_constraints_applied = []
+            portfolio_context_applied = []
             knowledge_sources_used = []
             recommendation_status = None
+            recommended_action_type = None
+            position_context = None
+            concentration_notes = []
             eligible_alternatives = []
 
         return CopilotChatResponse(
@@ -1867,7 +2987,11 @@ async def copilot_chat_tool(
             supporting_data=supporting_data,
             recommendation_status=recommendation_status,
             profile_constraints_applied=profile_constraints_applied,
+            portfolio_context_applied=portfolio_context_applied,
             knowledge_sources_used=knowledge_sources_used,
+            recommended_action_type=recommended_action_type,
+            position_context=position_context,
+            concentration_notes=concentration_notes,
             eligible_alternatives=eligible_alternatives,
             warnings=warnings,
             next_actions=next_actions,
@@ -1881,7 +3005,11 @@ async def copilot_chat_tool(
         profile, profile_warnings = load_investor_profile()
         if profile is not None:
             supporting_data["active_profile"] = profile.model_dump(mode="json")
+        portfolio, portfolio_warnings = load_local_portfolio()
+        if portfolio is not None:
+            supporting_data["active_portfolio"] = portfolio.model_dump(mode="json")
         warnings.extend(profile_warnings)
+        warnings.extend(portfolio_warnings)
         warnings.extend(kb.warnings)
         answer = CopilotChatAnswer(
             headline="Knowledge-base lookup complete",
@@ -1908,7 +3036,11 @@ async def copilot_chat_tool(
             supporting_data=supporting_data,
             recommendation_status=None,
             profile_constraints_applied=[],
+            portfolio_context_applied=[],
             knowledge_sources_used=kb.matches,
+            recommended_action_type=None,
+            position_context=None,
+            concentration_notes=[],
             eligible_alternatives=[],
             warnings=warnings,
             next_actions=next_actions,
@@ -1936,7 +3068,11 @@ async def copilot_chat_tool(
         supporting_data={},
         recommendation_status=None,
         profile_constraints_applied=[],
+        portfolio_context_applied=[],
         knowledge_sources_used=[],
+        recommended_action_type=None,
+        position_context=None,
+        concentration_notes=[],
         eligible_alternatives=[],
         warnings=warnings,
         next_actions=next_actions,

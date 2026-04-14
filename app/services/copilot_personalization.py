@@ -10,18 +10,21 @@ from typing import Any
 
 from app.schemas.backtest import BacktestMetrics
 from app.schemas.copilot import (
-    EligibleAlternative,
     InvestorProfile,
     KnowledgeBaseMatch,
     KnowledgeBaseQueryRequest,
     KnowledgeBaseQueryResponse,
+    LocalPortfolio,
+    PortfolioContextApplied,
     ProfileConstraintApplied,
+    PositionContext,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COPILOT_DATA_DIR = REPO_ROOT / "data" / "copilot"
 PROFILE_PATH = COPILOT_DATA_DIR / "profile.json"
 KNOWLEDGE_DIR = COPILOT_DATA_DIR / "knowledge"
+PORTFOLIO_PATH = COPILOT_DATA_DIR / "portfolio.json"
 
 STOPWORDS = {
     "the", "and", "for", "with", "that", "this", "from", "into", "your", "have", "has",
@@ -37,6 +40,19 @@ STRATEGY_KEYWORDS = {
     "rotation", "cross-preset", "cross preset", "walk-forward", "walk forward",
     "parameter sweep", "compare variants", "defensive asset", "cash",
 }
+EXPOSURE_GROUPS = {
+    "SPY": "us_large_cap_core",
+    "VOO": "us_large_cap_core",
+    "IVV": "us_large_cap_core",
+    "QQQ": "us_large_cap_growth",
+    "IWM": "us_small_cap",
+    "TLT": "long_treasury",
+    "IEF": "intermediate_treasury",
+    "GLD": "gold",
+    "XLE": "sector_energy",
+    "XLF": "sector_financials",
+}
+DEFAULT_CONCENTRATION_LIMIT = 0.35
 
 
 @dataclass(slots=True)
@@ -72,6 +88,17 @@ def load_investor_profile() -> tuple[InvestorProfile | None, list[str]]:
         return InvestorProfile.model_validate_json(raw), []
     except Exception as exc:  # pragma: no cover - defensive file handling
         return None, [f"Investor profile could not be loaded: {exc}"]
+
+
+def load_local_portfolio() -> tuple[LocalPortfolio | None, list[str]]:
+    if not PORTFOLIO_PATH.exists():
+        return None, [f"Local portfolio file is missing: {PORTFOLIO_PATH.name}."]
+
+    try:
+        raw = PORTFOLIO_PATH.read_text(encoding="utf-8")
+        return LocalPortfolio.model_validate_json(raw), []
+    except Exception as exc:  # pragma: no cover - defensive file handling
+        return None, [f"Local portfolio could not be loaded: {exc}"]
 
 
 def _parse_list_value(raw: str) -> list[str]:
@@ -355,6 +382,16 @@ def _append_constraint(
         preference_matches.append(detail)
 
 
+def _append_portfolio_context(
+    contexts: list[PortfolioContextApplied],
+    *,
+    check: str,
+    status: str,
+    detail: str,
+) -> None:
+    contexts.append(PortfolioContextApplied(check=check, status=status, detail=detail))
+
+
 def _knowledge_signal_category(match: KnowledgeBaseMatch, entity: str | None) -> tuple[str, str] | None:
     text = " ".join([match.title, match.snippet, " ".join(match.matched_terms)]).lower()
     entity_lower = entity.lower() if entity else None
@@ -571,5 +608,248 @@ def evaluate_policy_context(
         "preference_matches": preference_matches,
         "constraint_summary": constraint_summary,
         "recommendation_status": recommendation_status,
+        "warnings": warnings,
+    }
+
+
+def _exposure_group_for_ticker(ticker: str | None) -> str | None:
+    if not ticker:
+        return None
+    normalized = ticker.upper()
+    return EXPOSURE_GROUPS.get(normalized, normalized)
+
+
+def evaluate_portfolio_context(
+    *,
+    recommended_entity_type: str,
+    recommended_entity: str | None,
+    portfolio: LocalPortfolio | None,
+    base_status: str,
+) -> dict[str, Any]:
+    contexts: list[PortfolioContextApplied] = []
+    concentration_notes: list[str] = []
+    warnings: list[str] = []
+
+    if portfolio is None:
+        warnings.append("No active portfolio file is loaded, so portfolio constraints were not applied.")
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": "No active portfolio file is loaded, so portfolio constraints were not applied.",
+            "recommended_action_type": "review_only" if recommended_entity_type != "asset" else None,
+            "position_context": None,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": base_status,
+            "warnings": warnings,
+        }
+
+    _append_portfolio_context(
+        contexts,
+        check="active_portfolio",
+        status="context",
+        detail=f"Using local portfolio '{portfolio.portfolio_name}' in {portfolio.base_currency}.",
+    )
+
+    if base_status not in {"eligible", "eligible_with_cautions"}:
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": (
+                "Portfolio context was loaded, but the result was already non-actionable before portfolio checks."
+            ),
+            "recommended_action_type": "no_action",
+            "position_context": None,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": base_status,
+            "warnings": warnings,
+        }
+
+    if recommended_entity_type != "asset" or not recommended_entity:
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": "Portfolio loaded for context, but this recommendation is a strategy configuration rather than an asset-level trade.",
+            "recommended_action_type": "review_only",
+            "position_context": None,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": base_status,
+            "warnings": warnings,
+        }
+
+    positions = list(portfolio.positions)
+    candidate_ticker = recommended_entity.upper()
+    held_position = next((position for position in positions if position.ticker.upper() == candidate_ticker), None)
+    candidate_exposure_group = _exposure_group_for_ticker(candidate_ticker)
+
+    nav_estimate = float(portfolio.cash_available)
+    missing_cost_positions: list[str] = []
+    for position in positions:
+        if position.avg_cost is None:
+            missing_cost_positions.append(position.ticker.upper())
+            continue
+        nav_estimate += float(position.quantity) * float(position.avg_cost)
+
+    if missing_cost_positions:
+        detail = (
+            "Estimated portfolio exposure excludes positions without avg_cost: "
+            + ", ".join(sorted(missing_cost_positions))
+            + "."
+        )
+        _append_portfolio_context(
+            contexts,
+            check="valuation_completeness",
+            status="caution",
+            detail=detail,
+        )
+        warnings.append(detail)
+
+    group_value = 0.0
+    estimated_value = None
+    max_position_limit = None
+    for position in positions:
+        if position.avg_cost is None:
+            continue
+        current_value = float(position.quantity) * float(position.avg_cost)
+        if _exposure_group_for_ticker(position.ticker) == candidate_exposure_group:
+            group_value += current_value
+        if held_position is not None and position.ticker.upper() == candidate_ticker:
+            estimated_value = current_value
+            if position.max_position_size_pct is not None:
+                max_position_limit = float(position.max_position_size_pct)
+
+    position_weight_pct = (estimated_value / nav_estimate) if estimated_value is not None and nav_estimate > 0 else None
+    group_weight_pct = (group_value / nav_estimate) if nav_estimate > 0 else None
+
+    position_context = PositionContext(
+        ticker=candidate_ticker,
+        is_held=held_position is not None,
+        quantity=float(held_position.quantity) if held_position is not None else None,
+        avg_cost=float(held_position.avg_cost) if held_position is not None and held_position.avg_cost is not None else None,
+        estimated_value=estimated_value,
+        estimated_weight_pct=position_weight_pct,
+        exposure_group=candidate_exposure_group,
+        asset_type=held_position.asset_type if held_position is not None else None,
+        strategy_bucket=held_position.strategy_bucket if held_position is not None else None,
+    )
+
+    if held_position is not None:
+        detail = f"{candidate_ticker} is already held in the current portfolio."
+        _append_portfolio_context(
+            contexts,
+            check="existing_position",
+            status="preferred",
+            detail=detail,
+        )
+    elif group_weight_pct and group_weight_pct >= 0.25:
+        detail = (
+            f"Current portfolio already has meaningful exposure to {candidate_exposure_group}: "
+            f"{group_weight_pct:.1%} estimated weight."
+        )
+        _append_portfolio_context(
+            contexts,
+            check="redundant_exposure",
+            status="caution",
+            detail=detail,
+        )
+        concentration_notes.append(detail)
+
+    if portfolio.cash_available <= 0:
+        detail = "No cash is currently available for a new purchase or add-on."
+        _append_portfolio_context(
+            contexts,
+            check="cash_available",
+            status="block",
+            detail=detail,
+        )
+        warnings.append(detail)
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": detail,
+            "recommended_action_type": "no_action",
+            "position_context": position_context,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": "not_actionable_without_cash",
+            "warnings": warnings,
+        }
+
+    effective_limit = max_position_limit or DEFAULT_CONCENTRATION_LIMIT
+    if position_weight_pct is not None and position_weight_pct > effective_limit:
+        detail = (
+            f"{candidate_ticker} is already above the estimated concentration limit at "
+            f"{position_weight_pct:.1%} versus {effective_limit:.1%}."
+        )
+        _append_portfolio_context(
+            contexts,
+            check="position_concentration",
+            status="block",
+            detail=detail,
+        )
+        concentration_notes.append(detail)
+        warnings.append(detail)
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": detail,
+            "recommended_action_type": "avoid",
+            "position_context": position_context,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": "eligible_but_overconcentrated",
+            "warnings": warnings,
+        }
+
+    if held_position is None and group_weight_pct is not None and group_weight_pct >= 0.25:
+        detail = (
+            f"{candidate_ticker} looks redundant with the existing {candidate_exposure_group} sleeve "
+            f"at an estimated {group_weight_pct:.1%} weight."
+        )
+        if group_weight_pct > effective_limit:
+            detail += " The existing sleeve is already concentrated."
+        _append_portfolio_context(
+            contexts,
+            check="redundant_exposure",
+            status="block",
+            detail=detail,
+        )
+        concentration_notes.append(detail)
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": detail,
+            "recommended_action_type": "avoid",
+            "position_context": position_context,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": "redundant_exposure",
+            "warnings": warnings,
+        }
+
+    if held_position is not None:
+        detail = (
+            f"{candidate_ticker} is already held, so the portfolio-aware action is an add-to-existing-position review."
+        )
+        _append_portfolio_context(
+            contexts,
+            check="action_type",
+            status="preferred",
+            detail=detail,
+        )
+        return {
+            "portfolio_context_applied": contexts,
+            "portfolio_decision_summary": detail,
+            "recommended_action_type": "add_to_existing_position",
+            "position_context": position_context,
+            "concentration_notes": concentration_notes,
+            "recommendation_status": "eligible_add_to_existing",
+            "warnings": warnings,
+        }
+
+    detail = f"{candidate_ticker} is not currently held and cash is available, so this is a new-position candidate."
+    _append_portfolio_context(
+        contexts,
+        check="action_type",
+        status="preferred",
+        detail=detail,
+    )
+    return {
+        "portfolio_context_applied": contexts,
+        "portfolio_decision_summary": detail,
+        "recommended_action_type": "open_new_position",
+        "position_context": position_context,
+        "concentration_notes": concentration_notes,
+        "recommendation_status": "eligible_new_position",
         "warnings": warnings,
     }

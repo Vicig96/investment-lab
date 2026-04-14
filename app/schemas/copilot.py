@@ -8,6 +8,27 @@ from pydantic import BaseModel, Field
 
 from app.schemas.backtest import BacktestMetrics
 
+RecommendationStatus = Literal[
+    "eligible",
+    "eligible_with_cautions",
+    "rejected_by_profile",
+    "unsupported_by_knowledge",
+    "eligible_new_position",
+    "eligible_add_to_existing",
+    "eligible_but_overconcentrated",
+    "rejected_by_portfolio_constraints",
+    "not_actionable_without_cash",
+    "redundant_exposure",
+]
+
+RecommendedActionType = Literal[
+    "open_new_position",
+    "add_to_existing_position",
+    "avoid",
+    "no_action",
+    "review_only",
+]
+
 
 class CopilotToolSpec(BaseModel):
     name: str
@@ -213,6 +234,50 @@ class ExplainRecommendationRequest(BaseModel):
     strategy_evaluation: StrategyEvaluationResponse | None = None
 
 
+class ProfileConstraintApplied(BaseModel):
+    constraint: str
+    category: Literal["hard_block", "soft_caution", "preferred", "neutral"]
+    detail: str
+
+
+class PortfolioContextApplied(BaseModel):
+    check: str
+    status: Literal["context", "preferred", "caution", "block"]
+    detail: str
+
+
+class PortfolioPosition(BaseModel):
+    ticker: str
+    quantity: float = Field(ge=0)
+    avg_cost: float | None = Field(default=None, ge=0)
+    asset_type: str | None = None
+    strategy_bucket: str | None = None
+    entry_date: date | None = None
+    notes: str | None = None
+    target_role: str | None = None
+    max_position_size_pct: float | None = Field(default=None, ge=0, le=1)
+    thesis_ref: str | None = None
+
+
+class LocalPortfolio(BaseModel):
+    portfolio_name: str
+    base_currency: str
+    cash_available: float = Field(ge=0)
+    positions: list[PortfolioPosition] = Field(default_factory=list)
+
+
+class PositionContext(BaseModel):
+    ticker: str
+    is_held: bool
+    quantity: float | None = None
+    avg_cost: float | None = None
+    estimated_value: float | None = None
+    estimated_weight_pct: float | None = None
+    exposure_group: str | None = None
+    asset_type: str | None = None
+    strategy_bucket: str | None = None
+
+
 class RecommendationPayload(BaseModel):
     tool_name: Literal["explain_recommendation"] = "explain_recommendation"
     source: Literal["rank_assets", "strategy_evaluation"]
@@ -226,17 +291,17 @@ class RecommendationPayload(BaseModel):
     caveats: list[str]
     supporting_metrics: dict[str, Any]
     profile_constraints_applied: list["ProfileConstraintApplied"] = Field(default_factory=list)
+    portfolio_context_applied: list["PortfolioContextApplied"] = Field(default_factory=list)
     knowledge_sources_used: list["KnowledgeBaseMatch"] = Field(default_factory=list)
-    recommendation_status: Literal[
-        "eligible",
-        "eligible_with_cautions",
-        "rejected_by_profile",
-        "unsupported_by_knowledge",
-    ] = "eligible"
+    recommendation_status: RecommendationStatus = "eligible"
     hard_conflicts: list[str] = Field(default_factory=list)
     soft_conflicts: list[str] = Field(default_factory=list)
     preference_matches: list[str] = Field(default_factory=list)
     constraint_summary: str = ""
+    portfolio_decision_summary: str = ""
+    recommended_action_type: RecommendedActionType | None = None
+    position_context: PositionContext | None = None
+    concentration_notes: list[str] = Field(default_factory=list)
     eligible_alternatives: list["EligibleAlternative"] = Field(default_factory=list)
 
 
@@ -253,12 +318,6 @@ class InvestorProfile(BaseModel):
     notes: str | None = None
 
 
-class ProfileConstraintApplied(BaseModel):
-    constraint: str
-    category: Literal["hard_block", "soft_caution", "preferred", "neutral"]
-    detail: str
-
-
 class KnowledgeBaseQueryRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
@@ -269,7 +328,7 @@ class KnowledgeBaseQueryRequest(BaseModel):
 class EligibleAlternative(BaseModel):
     entity: str
     reason: str
-    recommendation_status: Literal["eligible", "eligible_with_cautions"]
+    recommendation_status: RecommendationStatus
 
 
 class KnowledgeBaseMatch(BaseModel):
@@ -298,6 +357,13 @@ class CopilotChatSessionState(BaseModel):
         "strategy_evaluation",
         "recommendation_explanation",
         "knowledge_base_query",
+        "monitoring_check",
+        "scorecard_check",
+        "outcome_review",
+        "comparative_validation",
+        "shadow_portfolio",
+        "paper_portfolio_nav",
+        "forward_validation_pilot",
         "unclear",
     ] | None = None
     last_ranking: RankAssetsResponse | None = None
@@ -316,6 +382,7 @@ class CopilotChatAnswer(BaseModel):
     bullets: list[str]
     deterministic_evidence_summary: str | None = None
     profile_decision_summary: str | None = None
+    portfolio_decision_summary: str | None = None
     final_recommendation_summary: str | None = None
     why_this_is_or_is_not_actionable: str | None = None
     confidence_notes: list[str] = Field(default_factory=list)
@@ -329,19 +396,25 @@ class CopilotChatResponse(BaseModel):
         "strategy_evaluation",
         "recommendation_explanation",
         "knowledge_base_query",
+        "monitoring_check",
+        "scorecard_check",
+        "outcome_review",
+        "comparative_validation",
+        "shadow_portfolio",
+        "paper_portfolio_nav",
+        "forward_validation_pilot",
         "unclear",
     ]
     tools_used: list[str]
     answer: CopilotChatAnswer
     supporting_data: dict[str, Any]
-    recommendation_status: Literal[
-        "eligible",
-        "eligible_with_cautions",
-        "rejected_by_profile",
-        "unsupported_by_knowledge",
-    ] | None = None
+    recommendation_status: RecommendationStatus | None = None
     profile_constraints_applied: list[ProfileConstraintApplied] = Field(default_factory=list)
+    portfolio_context_applied: list[PortfolioContextApplied] = Field(default_factory=list)
     knowledge_sources_used: list[KnowledgeBaseMatch] = Field(default_factory=list)
+    recommended_action_type: RecommendedActionType | None = None
+    position_context: PositionContext | None = None
+    concentration_notes: list[str] = Field(default_factory=list)
     eligible_alternatives: list[EligibleAlternative] = Field(default_factory=list)
     warnings: list[str]
     next_actions: list[str]

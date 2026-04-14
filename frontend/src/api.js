@@ -22,10 +22,11 @@ async function request(method, path, { body, form } = {}) {
   return data
 }
 
-const get  = (path)        => request('GET',    path)
-const post = (path, body)  => request('POST',   path, { body })
-const del  = (path)        => request('DELETE', path)
-const postForm = (path, form) => request('POST', path, { form })
+const get      = (path)        => request('GET',    path)
+const post     = (path, body)  => request('POST',   path, { body })
+const patch    = (path, body)  => request('PATCH',  path, { body })
+const del      = (path)        => request('DELETE', path)
+const postForm = (path, form)  => request('POST',   path, { form })
 
 // ── Instruments ──────────────────────────────────────────────────────────────
 export const listInstruments = ()     => get('/instruments')
@@ -69,4 +70,28 @@ export const runScreener = (body) => post('/screener/run', body)
 
 // ── Screener Rotation Backtest ────────────────────────────────────────────────
 export const runScreenerRotation = (body) => post('/screener/rotation/run', body)
+
+// ── Copilot chat ──────────────────────────────────────────────────────────────
 export const runCopilotChat = (body) => post('/copilot/chat', body)
+export const runCopilotMonitoring = (body = {}) => post('/copilot/monitoring/run', body)
+export const runCopilotComparativeValidation = (body = {}) => post('/copilot/comparative_validation', body)
+export const runCopilotForwardValidationPilot = (body = {}) => post('/copilot/forward_validation_pilot', body)
+export const runCopilotOutcomes = (body = {}) => post('/copilot/outcomes', body)
+export const runCopilotPaperPortfolioNav = (body = {}) => post('/copilot/paper_portfolio_nav', body)
+export const runCopilotShadowPortfolio = (body = {}) => post('/copilot/shadow_portfolio', body)
+export const runCopilotScorecard = (body = {}) => post('/copilot/scorecard', body)
+export const listCopilotFindings = (params = {}) => {
+  const filtered = Object.fromEntries(Object.entries(params).filter(([, v]) => v != null))
+  const qs = new URLSearchParams(filtered).toString()
+  return get(`/copilot/monitoring/findings${qs ? '?' + qs : ''}`)
+}
+
+// ── Copilot decision journal ──────────────────────────────────────────────────
+export const saveJournalDecision   = (body)       => post('/copilot/journal', body)
+export const updateJournalDecision = (id, body)   => patch(`/copilot/journal/${id}`, body)
+export const getJournalDecision    = (id)          => get(`/copilot/journal/${id}`)
+export const listJournalDecisions  = (params = {}) => {
+  const filtered = Object.fromEntries(Object.entries(params).filter(([, v]) => v != null))
+  const qs = new URLSearchParams(filtered).toString()
+  return get(`/copilot/journal${qs ? '?' + qs : ''}`)
+}
